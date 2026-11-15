@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 (2026-11-15)
 
 Manifests, outputs and capture hashes are unchanged: nothing is reshot on upgrade.
 
