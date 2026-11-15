@@ -207,3 +207,24 @@ def test_paced_clock_from_ready(server, write_manifest, engine):
     assert shoot(load(p), log=quiet) == 0
     meta = json.loads((p.parent / ".darkroom/takes/ready/meta.json").read_text())
     assert meta["crop"] == {"of": "#box", "pad": 0, "rect": [260, 120, 80, 50]}
+
+
+def test_type_steps_fill_vars():
+    from darkroom.backends.web import template_steps
+    out = template_steps([{"type": "{user}"}, {"repeat": 1, "steps": [{"type": "hi {user}"}]}], {"user": "ada"})
+    assert out[0]["type"] == "ada" and out[1]["steps"][0]["type"] == "hi ada"
+
+
+def test_setup_dir_is_searched(tmp_path, monkeypatch):
+    from darkroom.backends import web
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    env = web.node_env(tmp_path)
+    assert str(tmp_path / "darkroom" / "node_modules") in env["NODE_PATH"].split(":")
+
+
+def test_setup_web_link_rejects_a_folder_without_playwright(tmp_path, monkeypatch, capsys):
+    from darkroom.cli import main
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    (tmp_path / "nm").mkdir()
+    assert main(["setup-web", "--link", str(tmp_path / "nm")]) == 2
+    assert "no playwright" in capsys.readouterr().err

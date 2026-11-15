@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -128,6 +130,39 @@ def _age(started: str | None) -> str:
     except (TypeError, ValueError):
         return "?"
     return f"{secs // 3600}h{secs % 3600 // 60:02d}m" if secs >= 3600 else f"{secs // 60}m{secs % 60:02d}s"
+
+
+def cmd_setup_web(args):
+    """Give darkroom a node_modules of its own with Playwright in it, searched by every web shot:
+    a link to an existing install (--link), or a fresh npm install (--install)."""
+    from .backends import web
+    dest = web.setup_dir()
+    if args.link:
+        src = Path(args.link).expanduser().resolve()
+        if not (src / "playwright").is_dir():
+            print(f"darkroom: {src} has no playwright folder (give a node_modules that has it)", file=sys.stderr)
+            return 2
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.is_symlink() or dest.exists():
+            if not dest.is_symlink():
+                print(f"darkroom: {dest} exists and is not a link; remove it first", file=sys.stderr)
+                return 2
+            dest.unlink()
+        dest.symlink_to(src, target_is_directory=True)
+    elif args.install:
+        npm = shutil.which("npm")
+        if not npm:
+            print("darkroom: --install needs npm on PATH", file=sys.stderr)
+            return 2
+        prefix = dest.parent
+        prefix.mkdir(parents=True, exist_ok=True)
+        r = subprocess.run([npm, "install", "--prefix", str(prefix), "--no-save", f"playwright@{args.version}" if args.version else "playwright"])
+        if r.returncode:
+            return r.returncode
+        subprocess.run([shutil.which("npx") or "npx", "--prefix", str(prefix), "playwright", "install", "chromium"])
+    ok = web.playwright_available(Path.cwd())
+    print(f"{dest}: playwright {'found' if ok else 'NOT found'}")
+    return 0 if ok else 1
 
 
 def cmd_ps(args):
@@ -273,6 +308,13 @@ def main(argv=None):
                    help="run up to N independent shots at once (default 1); shots with the same lock "
                    "never overlap, dependents wait, and one session's shots run in order")
     p.set_defaults(fn=cmd_shoot)
+
+    p = sub.add_parser("setup-web", help="give darkroom its own Playwright for web shots (once per machine)")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--link", metavar="NODE_MODULES", help="link an existing node_modules that has playwright")
+    g.add_argument("--install", action="store_true", help="npm install playwright (and Chromium) into darkroom's cache")
+    p.add_argument("--version", help="with --install: the playwright version to install")
+    p.set_defaults(fn=cmd_setup_web)
 
     p = sub.add_parser("ps", help="list this user's running darkroom shoots (stale entries are pruned)")
     p.add_argument("--json", action="store_true")

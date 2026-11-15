@@ -19,7 +19,11 @@ function loadPlaywright(cwd) {
   tries.push(() => require("playwright"));
   if (cwd) tries.push(() => createRequire(path.join(cwd, "package.json"))("playwright"));
   for (const t of tries) { try { return t(); } catch (e) { /* next */ } }
-  throw new Error("playwright not found: set NODE_PATH to a node_modules that has it, or npm i playwright in the project");
+  throw new Error("playwright not found. Searched: " +
+    [process.env.DARKROOM_PLAYWRIGHT && `$DARKROOM_PLAYWRIGHT (${process.env.DARKROOM_PLAYWRIGHT})`,
+     `NODE_PATH (${process.env.NODE_PATH || "unset"})`, cwd && `${cwd}/node_modules and its parents`].filter(Boolean).join("; ") +
+    ". Fix it once with `darkroom setup-web --link /path/to/node_modules` (a node_modules that has playwright) " +
+    "or `darkroom setup-web --install`, or set NODE_PATH or DARKROOM_PLAYWRIGHT.");
 }
 
 function readStdin() {

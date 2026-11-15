@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `type` steps fill in vars (`{user}`), like `goto` and capture names.
+- `darkroom setup-web --link DIR | --install`: darkroom's own Playwright (in its cache), searched by every web shot, so `NODE_PATH` isn't needed once it's set up. A failed lookup now lists every place it searched and how to fix it.
+
 ## 0.7.0 (2026-11-15)
 
 0.6 manifests keep working, and the capture and encode hashes of unchanged shots are the same,
