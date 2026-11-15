@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 (unreleased)
+## 0.3.0 (2026-11-15)
 
 From a second pilot: a Strata web-kit game shot in software WebGL on a heavily loaded machine.
 0.2 manifests keep working unchanged.
