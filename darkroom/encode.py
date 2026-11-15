@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -84,30 +84,32 @@ def crop_aspect(im: Image.Image, aspect: str | None) -> Image.Image:
 # ------------------------------------------------------------------ stills
 
 def encode_still(im: Image.Image, out: Path, budget_kb: float, fmt: str = "jpg",
-                 quality: int = 86, width: int | None = None) -> Result:
+                 quality: int = 86, width: int | None = None, colors: int | None = None) -> Result:
     """JPEG: step quality down (to 40), then shrink width by 15% steps, until under budget.
-    PNG: optimize; if too big, quantize to 256/128/64 colours, then shrink."""
+    PNG: optimize; if too big, quantize to 256/128/64 colours, then shrink. ``colors`` (PNG
+    only) quantizes to at most that many colours from the start."""
     out.parent.mkdir(parents=True, exist_ok=True)
     im = resize_width(im.convert("RGB"), width)
     budget = budget_kb * 1024
     notes: list[str] = []
     if fmt == "png":
-        attempts = [(None, im)]
-        for colors in (256, 128, 64):
-            attempts.append((colors, im))
-        cur = im
+        attempts = [(colors, im)]
+        for n in (256, 128, 64):
+            if colors is None or n < colors:
+                attempts.append((n, im))
+        cur, floor = im, min(64, colors or 64)
         for _ in range(4):
             cur = cur.resize((max(1, int(cur.width * .85)), max(1, int(cur.height * .85))), Image.LANCZOS)
-            attempts.append((64, cur))
+            attempts.append((floor, cur))
         data = b""
-        for colors, src in attempts:
+        for n, src in attempts:
             buf = io.BytesIO()
-            img = src if colors is None else src.quantize(colors=colors, method=Image.Quantize.FASTOCTREE)
+            img = src if n is None else src.quantize(colors=n, method=Image.Quantize.FASTOCTREE)
             img.save(buf, "PNG", optimize=True)
             data = buf.getvalue()
             if len(data) <= budget:
-                if colors:
-                    notes.append(f"{colors} colours")
+                if n:
+                    notes.append(f"{n} colours")
                 if src.width != im.width:
                     notes.append(f"width {src.width}")
                 break
@@ -142,8 +144,14 @@ def encode_still(im: Image.Image, out: Path, budget_kb: float, fmt: str = "jpg",
 _METHODS = {"octree": Image.Quantize.FASTOCTREE, "median": Image.Quantize.MEDIANCUT}
 
 
+# Palette index 255 is never a colour: frames quantize to at most 255 colours, and the
+# inter-frame optimizer marks unchanged pixels with this index as transparent.
+TRANSPARENT = 255
+
+
 def _quantize_frames(frames: list[Image.Image], palette: str, colors: int, dither: bool) -> list[Image.Image]:
     d = Image.Dither.FLOYDSTEINBERG if dither else Image.Dither.NONE
+    colors = max(2, min(colors, 255))
     if palette == "adaptive":
         # One palette for the whole clip, built from a strip of sampled frames: no colour
         # flicker between frames. Octree keeps small saturated details that median cut
@@ -158,16 +166,121 @@ def _quantize_frames(frames: list[Image.Image], palette: str, colors: int, dithe
     return [f.quantize(colors=colors, method=method, dither=d) for f in frames]
 
 
-def _gif_bytes(frames, fps, palette, colors, dither, loop, hold_last_ms=0) -> bytes:
+def _full_palette(im: Image.Image) -> bytes:
+    """A frame's palette as exactly 256 RGB entries (unused ones black)."""
+    pal = bytes(im.getpalette("RGB") or [])[:768]
+    return pal + bytes(768 - len(pal))
+
+
+def _lzw_data(im: Image.Image) -> tuple[bytes, bool]:
+    """LZW image data (min code size + sub-blocks + terminator) for a "P" frame whose palette
+    has 256 entries, encoded by Pillow as a one-frame GIF and lifted out of it. Pillow is told
+    not to optimize, so the colour indices are written as they are. Returns (data, interlaced)."""
+    frame = im.copy()
+    frame.info.pop("transparency", None)
+    frame.putpalette(_full_palette(im), "RGB")
+    buf = io.BytesIO()
+    frame.save(buf, "GIF", optimize=False, interlace=False)
+    b = buf.getvalue()
+    pos = 13
+    if b[10] & 0x80:
+        pos += 3 << ((b[10] & 7) + 1)
+    while b[pos] == 0x21:  # extensions: label, then sub-blocks
+        pos += 2
+        while b[pos]:
+            pos += b[pos] + 1
+        pos += 1
+    if b[pos] != 0x2C:
+        raise ValueError("unexpected GIF layout from Pillow")
+    packed = b[pos + 9]
+    pos += 10
+    if packed & 0x80:
+        pos += 3 << ((packed & 7) + 1)
+    start = pos
+    pos += 1  # LZW minimum code size
+    while b[pos]:
+        pos += b[pos] + 1
+    return b[start:pos + 1], bool(packed & 0x40)
+
+
+def _changed(prev: Image.Image, cur: Image.Image) -> tuple[Image.Image, tuple | None]:
+    """A mask ("L", 255 = unchanged) of pixels whose displayed colour did not change, and the
+    bounding box of the changed pixels (None when nothing changed)."""
+    diff = ImageChops.difference(prev, cur)
+    bbox = diff.getbbox()
+    r, g, b = diff.split()
+    any_change = ImageChops.lighter(ImageChops.lighter(r, g), b)
+    return any_change.point([255] + [0] * 255), bbox
+
+
+def write_gif(q: Sequence[Image.Image], durations: Sequence[int], loop: int | None = 0,
+              shared_palette: bool = True) -> bytes:
+    """darkroom's own GIF writer with safe inter-frame optimization.
+
+    Every frame after the first keeps only the pixels that changed from the frame before:
+    unchanged pixels become the reserved transparent index (255) and the frame is cropped to
+    the bounding box of the changes. Frames are not disposed (disposal 1), so each one paints
+    over the last. With a shared palette there is one global 256-entry table and no local
+    ones; with per-frame palettes every frame carries its own full 256-entry table. Colour
+    indices therefore always fall inside the table in force (unlike Pillow's optimizer, which
+    trims palettes and can leave indices past the end; strict decoders reject those files).
+    A frame identical to the one before is dropped and its time added to the previous one."""
+    import struct
+    w, h = q[0].size
+    out = bytearray(b"GIF89a")
+    if shared_palette:
+        out += struct.pack("<HHBBB", w, h, 0xF7, 0, 0) + _full_palette(q[0])
+    else:
+        out += struct.pack("<HHBBB", w, h, 0x70, 0, 0)
+    if loop is not None:
+        out += b"\x21\xFF\x0BNETSCAPE2.0\x03\x01" + struct.pack("<H", loop) + b"\x00"
+    # (image, box, transparent?, duration ms[, opaque crop]), merging unchanged frames into
+    # the one before.
+    frames: list[list] = []
+    prev_rgb = None
+    for im, ms in zip(q, durations):
+        rgb = im.convert("RGB")
+        if prev_rgb is None:
+            frames.append([im, (0, 0, w, h), False, ms])
+        else:
+            unchanged, bbox = _changed(prev_rgb, rgb)
+            if bbox is None:
+                frames[-1][3] += ms
+                continue
+            delta = im.copy()
+            delta.paste(TRANSPARENT, mask=unchanged)
+            frames.append([delta.crop(bbox), bbox, True, ms, im.crop(bbox)])
+        prev_rgb = rgb
+    for im, box, transparent, ms, *opaque in frames:
+        data, interlaced = _lzw_data(im)
+        if opaque:
+            # Transparency usually wins; in busy motion it can break up runs the plain crop
+            # compresses better. Keep whichever is smaller (both show the same picture).
+            plain, plain_il = _lzw_data(opaque[0])
+            if len(plain) < len(data):
+                data, interlaced, transparent = plain, plain_il, False
+        cs = max(2, round(ms / 10))
+        out += b"\x21\xF9\x04" + bytes([(1 << 2) | (1 if transparent else 0)]) + struct.pack("<H", cs)
+        out += bytes([TRANSPARENT if transparent else 0, 0])
+        packed = (0x40 if interlaced else 0) | (0 if shared_palette else 0x87)
+        out += b"\x2C" + struct.pack("<HHHHB", box[0], box[1], im.width, im.height, packed)
+        if not shared_palette:
+            out += _full_palette(im)
+        out += data
+    out += b"\x3B"
+    return bytes(out)
+
+
+def _gif_bytes(frames, fps, palette, colors, dither, loop, hold_last_ms=0, optimize=True) -> bytes:
     q = _quantize_frames(frames, palette, colors, dither)
     ms = max(20, round(1000 / fps))
     durations = [ms] * len(q)
     if hold_last_ms:
-        durations[-1] = hold_last_ms
+        durations[-1] = max(durations[-1], int(hold_last_ms))
+    if optimize:
+        return write_gif(q, durations, loop, shared_palette=(palette == "adaptive"))
+    # The 0.2 path, kept for comparison: Pillow without its optimizer (full frames).
     buf = io.BytesIO()
-    # No optimize: Pillow's optimizer crops frames and trims their palettes, and can leave
-    # colour indices past the trimmed table: GIFs that strict decoders (ImageMagick) reject.
-    # Budget fitting makes up the size.
     q[0].save(buf, "GIF", save_all=True, append_images=q[1:], duration=durations,
               loop=loop, optimize=False, disposal=1)
     return buf.getvalue()
@@ -175,16 +288,17 @@ def _gif_bytes(frames, fps, palette, colors, dither, loop, hold_last_ms=0) -> by
 
 def encode_gif(frames: Sequence[Image.Image], out: Path, budget_mb: float, fps: float = 12,
                width: int | None = 640, palette: str = "adaptive", colors: int = 256,
-               dither: bool = False, loop: int = 0) -> Result:
+               dither: bool = False, loop: int = 0, hold_last_ms: int = 0) -> Result:
     """Encode a GIF and fit it under ``budget_mb``: fewer colours (to 64), then narrower
     (by 15% steps, not under 240 px), then every other frame dropped (fps halves, so the
-    clip keeps its length). Returns what it did in ``notes``."""
+    clip keeps its length). ``hold_last_ms`` shows the last frame that long before the loop
+    restarts. Returns what it did in ``notes``."""
     out.parent.mkdir(parents=True, exist_ok=True)
     budget = budget_mb * 1024 * 1024
     base = [resize_width(f.convert("RGB"), width) for f in frames]
     cur, cur_fps, cur_colors = base, fps, colors
     notes: list[str] = []
-    data = _gif_bytes(cur, cur_fps, palette, cur_colors, dither, loop)
+    data = _gif_bytes(cur, cur_fps, palette, cur_colors, dither, loop, hold_last_ms)
     while len(data) > budget:
         if cur_colors > 64:
             cur_colors = max(64, cur_colors // 2)
@@ -196,7 +310,7 @@ def encode_gif(frames: Sequence[Image.Image], out: Path, budget_mb: float, fps: 
             cur_fps = cur_fps / 2
         else:
             break
-        data = _gif_bytes(cur, cur_fps, palette, cur_colors, dither, loop)
+        data = _gif_bytes(cur, cur_fps, palette, cur_colors, dither, loop, hold_last_ms)
     if cur_colors != colors:
         notes.append(f"{cur_colors} colours")
     if base and cur[0].width != base[0].width:
@@ -228,9 +342,9 @@ CRF_LADDER = {"mp4": [23, 26, 29, 32, 35, 38], "webm": [33, 36, 40, 44, 48]}
 
 
 def encode_video(frames: Sequence[Image.Image], out: Path, fmt: str, budget_kb: float,
-                 fps: float = 30, width: int | None = None) -> Result | None:
-    """MP4 (H.264, yuv420p, even dimensions, faststart) or WebM (VP9). Returns None when
-    no ffmpeg is available."""
+                 fps: float = 30, width: int | None = None, hold_last: float = 0) -> Result | None:
+    """MP4 (H.264, yuv420p, even dimensions, faststart) or WebM (VP9). ``hold_last`` (seconds)
+    holds the last frame that much longer. Returns None when no ffmpeg is available."""
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
         return None
@@ -239,8 +353,11 @@ def encode_video(frames: Sequence[Image.Image], out: Path, fmt: str, budget_kb: 
     with tempfile.TemporaryDirectory(prefix="darkroom-video-") as tmp:
         for i, f in enumerate(frames):
             resize_width(f.convert("RGB"), width).save(Path(tmp) / f"{i:05d}.png", compress_level=1)
+        vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        if hold_last and hold_last > 0:
+            vf += f",tpad=stop_mode=clone:stop_duration={float(hold_last):g}"
         base = [ffmpeg, "-y", "-loglevel", "error", "-framerate", f"{fps:g}", "-i",
-                str(Path(tmp) / "%05d.png"), "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-an"]
+                str(Path(tmp) / "%05d.png"), "-vf", vf, "-an"]
         crf_used = None
         for crf in CRF_LADDER[fmt]:
             if fmt == "mp4":
