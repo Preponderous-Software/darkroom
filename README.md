@@ -36,6 +36,9 @@ pip install "darkroom[video] @ git+https://github.com/Preponderous-Software/dark
 - The `web` backend needs Node.js and Playwright (`npm i playwright && npx playwright
   install chromium`). darkroom looks for `playwright` in the manifest's `node_modules`, then
   `$NODE_PATH`, then `$DARKROOM_PLAYWRIGHT`.
+  Once per machine, `darkroom setup-web --link /path/to/node_modules` (an existing install that has
+  Playwright) or `darkroom setup-web --install` gives darkroom its own copy, searched by every web shot;
+  a failed lookup lists every place it searched.
 - The `command` backend's `xvfb: true` needs `Xvfb` (`apt install xvfb`).
 
 **Pin a version on shared machines.** Several projects on one machine can share one darkroom;

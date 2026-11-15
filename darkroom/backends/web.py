@@ -31,14 +31,16 @@ def action_timeout_ms(shot) -> int:
 
 
 def template_steps(steps, variables: dict):
-    """Fill vars into ``goto`` URLs and capture names (other step text is JS, which sees ``vars``
-    itself)."""
+    """Fill vars into ``goto`` URLs, ``type`` text and capture names (other step text is JS, which
+    sees ``vars`` itself)."""
     out = []
     for st in steps or []:
         if isinstance(st, dict):
             st = dict(st)
             if isinstance(st.get("goto"), str):
                 st["goto"] = template(st["goto"], variables)
+            if isinstance(st.get("type"), str):  # typed text may use vars ("{user}")
+                st["type"] = template(st["type"], variables)
             if isinstance(st.get("capture"), str):  # capture names may use vars ("menu-{value}")
                 st["capture"] = template(st["capture"], variables)
             if isinstance(st.get("steps"), list):
@@ -65,11 +67,18 @@ def init_scripts(init, variables: dict, project: Path) -> list[str]:
     return out
 
 
+def setup_dir() -> Path:
+    """darkroom's own node_modules (``darkroom setup-web``), always searched for Playwright."""
+    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base) / "darkroom" / "node_modules"
+
+
 def node_env(project_dir: Path) -> dict:
     env = dict(os.environ)
     paths = [str(project_dir / "node_modules")]
     if env.get("NODE_PATH"):
         paths.append(env["NODE_PATH"])
+    paths.append(str(setup_dir()))
     env["NODE_PATH"] = os.pathsep.join(paths)
     return env
 
