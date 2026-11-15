@@ -35,19 +35,19 @@ ADAPTERS = ("strata-kit", "hook")
 PALETTES = ("octree", "median", "adaptive")
 VIDEO_FORMATS = ("mp4", "webm")
 
-TOP_KEYS = {"$schema", "out", "vars", "devices", "budgets", "defaults", "shots", "description"}
+TOP_KEYS = {"$schema", "out", "vars", "devices", "budgets", "defaults", "shots", "description", "gallery"}
 COMMON_SHOT_KEYS = {
     "name", "kind", "backend", "caption", "alt", "device", "retries", "timeout", "lock",
     "lockTimeout", "format", "quality", "width", "gif", "video", "poster", "sheet", "budgets", "skip", "comment",
-    "aspect", "speed", "fps", "file", "gallery", "every", "colors", "inputs", "depends",
+    "aspect", "speed", "fps", "file", "gallery", "every", "colors", "inputs", "depends", "vars",
 }
 WEB_KEYS = {"url", "adapter", "ready", "readyTimeout", "css", "setup", "steps",
             "failOnConsoleError", "waitUntil", "launchArgs", "crop", "userAgent", "block", "each",
-            "screenshotTimeout", "frameStep", "initScript", "context"}
+            "screenshotTimeout", "frameStep", "initScript", "context", "failOnConsole", "session"}
 COMMAND_KEYS = {"argv", "env", "cwd", "xvfb", "repeat", "glob", "each", "outputs"}
 # A prep runs a command that writes files (no images): only these keys apply.
 PREP_KEYS = {"name", "kind", "backend", "comment", "skip", "lock", "lockTimeout", "timeout", "retries", "inputs",
-             "depends", "device", "argv", "env", "cwd", "xvfb", "outputs"}
+             "depends", "device", "argv", "env", "cwd", "xvfb", "outputs", "vars"}
 OUTPUT_KEYS = {"file", "caption", "alt"}
 # Browser-context options darkroom sets itself, and the shot field that sets each.
 CONTEXT_OWNED = {"viewport": "device", "deviceScaleFactor": "device (dpr)", "hasTouch": "device (touch)",
@@ -63,15 +63,28 @@ STILL_EXTS = {".jpg": "jpg", ".jpeg": "jpg", ".png": "png"}
 CLIP_EXTS = (".gif", ".mp4", ".webm")
 GIF_KEYS = {"fps", "width", "palette", "colors", "dither", "loop", "budget_mb", "hold_last_ms", "every"}
 VIDEO_KEYS = {"formats", "every", "hold_last"}
-GALLERY_KEYS = {"width", "poster"}
+GALLERY_KEYS = {"width", "poster", "row"}
+# The manifest's top-level `gallery`: how `darkroom gallery` lays the shots out by default.
+TOP_GALLERY_KEYS = {"layout", "by", "widths"}
+GALLERY_LAYOUTS = ("list", "table")
+GALLERY_BY = ("device",)
+# Playwright console message types (plus "pageerror", an uncaught exception), for failOnConsole.
+CONSOLE_TYPES = ("error", "warning", "info", "log", "debug", "pageerror", "assert", "trace", "dir",
+                 "dirxml", "table", "clear", "count", "timeEnd", "startGroup", "startGroupCollapsed",
+                 "endGroup", "profile", "profileEnd")
+# Fields every shot of one web `session` shares: the page is opened (and `setup` run) once, with
+# the first shot's values.
+SESSION_FIELDS = ("url", "adapter", "ready", "readyTimeout", "waitUntil", "css", "setup", "device",
+                  "userAgent", "block", "launchArgs", "initScript", "context", "frameStep", "lock")
 CAPTURE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 DEVICE_KEYS = {"width", "height", "dpr", "touch", "mobile"}
 
 STEP_KEYS = {
-    "js": set(), "key": {"action"}, "tap": set(), "click": set(), "wait": set(),
+    "js": set(), "key": {"action"}, "tap": {"force"}, "click": {"force"}, "wait": set(),
     "waitFor": {"timeout"}, "frames": {"step"}, "camera": set(), "capture": set(),
     "repeat": {"steps", "var"}, "css": set(), "type": set(), "mark": set(),
     "until": {"steps", "max", "then", "var"}, "goto": set(), "reload": set(),
+    "stable": {"timeout"},
 }
 
 # What changes the captured pixels (a reshoot) and what changes only the encoding (re-encode
@@ -204,6 +217,46 @@ class Manifest:
     vars: dict[str, Any] = field(default_factory=dict)
     # `shoot --out DIR`: every output (including `file` ones) goes here instead.
     out_override: Path | None = None
+    # `--var NAME=VALUE`: these win over a shot's own `vars` too.
+    overrides: dict[str, Any] = field(default_factory=dict)
+
+    def shot_vars(self, shot: Shot) -> dict[str, Any]:
+        """The vars a shot sees: its own ``vars`` merged over the manifest's (``--var`` still
+        wins), expanded like the manifest's. Without shot vars, exactly ``self.vars``."""
+        own = shot.get("vars")
+        if not isinstance(own, dict) or not own:
+            return self.vars
+        variables = dict(self.vars)
+        variables.update(own)
+        variables.update({k: v for k, v in self.overrides.items() if k in variables})
+        return expand_vars(variables)
+
+    def device_name(self, shot: Shot, variables: dict | None = None) -> str | None:
+        """The shot's device name with ``{var}`` filled in (None for an inline device)."""
+        dev = shot.get("device", "desktop")
+        if isinstance(dev, dict):
+            return None
+        return str(template(dev, self.shot_vars(shot) if variables is None else variables))
+
+    def shot_device(self, shot: Shot, variables: dict | None = None) -> dict[str, Any]:
+        """The device spec for a shot (or one ``each`` run, given its variables)."""
+        dev = shot.get("device", "desktop")
+        if isinstance(dev, str) and placeholders(dev):
+            name = self.device_name(shot, variables)
+            if placeholders(name) or (name not in DEVICES and name not in self.data.get("devices", {})):
+                raise KeyError(f"{shot.name}: device '{dev}' gives '{name}', which is not a device"
+                               + _suggest(name, list(DEVICES) + list(self.data.get("devices", {}))))
+            return self.device(name)
+        return self.device(dev)
+
+    def device_varies(self, shot: Shot) -> bool:
+        """Does the device change from one ``each`` run to the next (``"device": "{value}"``)?"""
+        dev = shot.get("device")
+        return isinstance(dev, str) and bool(placeholders(dev) & {"value", "i"}) and bool(shot.get("each"))
+
+    def run_vars(self, shot: Shot, i: int) -> dict[str, Any]:
+        each = shot.get("each") or []
+        return dict(self.shot_vars(shot), value=each[i], i=i, n=len(each))
 
     @property
     def dir(self) -> Path:
@@ -287,8 +340,13 @@ class Manifest:
             outs = shot.raw["outputs"]
             fields["outputs"] = ({k: v["file"] if isinstance(v, dict) else v for k, v in outs.items()}
                                  if isinstance(outs, dict) else outs)
-        blob = {"shot": fields, "vars": self.vars, "tag": tag,
-                "device": self.device(shot.get("device", "desktop")) if not shot.composite else None}
+        if shot.composite:
+            device = None
+        elif self.device_varies(shot):  # one device per each value
+            device = [self.shot_device(shot, self.run_vars(shot, i)) for i in range(len(shot["each"]))]
+        else:
+            device = self.shot_device(shot)
+        blob = {"shot": fields, "vars": self.shot_vars(shot), "tag": tag, "device": device}
         # Only shots that read files (inputs, a prep's outputs, an init script file) get this
         # key, so the hashes of every other shot are the same as in 0.3.
         files = self.input_files(shot)
@@ -300,14 +358,15 @@ class Manifest:
         """The paths and globs (relative to the manifest, vars filled in) whose contents feed
         a shot's capture hash: its ``inputs``, the ``outputs`` of the preps it ``depends`` on,
         and its ``initScript`` files."""
-        pats = [str(x) for x in template(shot.get("inputs") or [], self.vars)]
+        variables = self.shot_vars(shot)
+        pats = [str(x) for x in template(shot.get("inputs") or [], variables)]
         if shot.get("depends"):
             by_name = {s.name: s for s in self.shots}
             for dep in shot["depends"]:
                 d = by_name.get(dep)
                 if d is not None and d.prep and isinstance(d.get("outputs"), list):
-                    pats += [str(x) for x in template(d["outputs"], self.vars)]
-        pats += [f for f in init_files(shot.get("initScript"), self.vars)]
+                    pats += [str(x) for x in template(d["outputs"], self.shot_vars(d))]
+        pats += [f for f in init_files(shot.get("initScript"), variables)]
         return pats
 
     def input_files(self, shot: Shot) -> dict[str, str | None]:
@@ -327,7 +386,7 @@ class Manifest:
         if isinstance(gallery, dict) and gallery.get("poster"):
             fields["gallery.poster"] = True  # makes a poster file; gallery.width does not
         return _digest({"shot": fields, "budgets": self.budgets(shot), "tag": tag,
-                        "out": str(self.out_dir), "file_vars": template(shot.raw.get("file"), self.vars)})
+                        "out": str(self.out_dir), "file_vars": template(shot.raw.get("file"), self.shot_vars(shot))})
 
     def legacy_hash(self, shot: Shot, tag: str | None, version: str) -> str:
         """The 0.1/0.2 whole-shot hash, to recognise state written by those versions."""
@@ -395,13 +454,18 @@ def load(path: str | Path, overrides: dict[str, str] | None = None) -> Manifest:
         # --var on a list var is split like a shell would ("--fast --seed 7").
         variables[k] = shlex.split(v) if isinstance(variables.get(k), list) and isinstance(v, str) else v
     variables.setdefault("manifest_dir", str(path.parent))
-    # Vars may refer to other vars ("page": "file://{manifest_dir}/index.html").
+    return Manifest(path, data, expand_vars(variables),
+                    overrides={k: variables[k] for k in overrides or {}})
+
+
+def expand_vars(variables: dict[str, Any]) -> dict[str, Any]:
+    """Vars may refer to other vars ("page": "file://{manifest_dir}/index.html")."""
     for _ in range(5):
         expanded = {k: template(v, variables) for k, v in variables.items()}
         if expanded == variables:
             break
         variables = expanded
-    return Manifest(path, data, variables)
+    return variables
 
 
 def _check_keys(obj: dict, allowed: set, where: str, problems: list[str]):
@@ -435,8 +499,18 @@ def validate_steps(steps, where: str, adapter: str, problems: list[str], kind: s
         verb = verbs[0]
         _check_keys(st, {verb} | STEP_KEYS[verb], w, problems)
         v = st[verb]
-        if verb in ("js", "click", "waitFor", "css", "type") and not isinstance(v, str):
-            problems.append(f"{w}.{verb}: must be a string")
+        if verb in ("tap", "click") and isinstance(v, dict):
+            _check_keys(v, {"at", "of"}, f"{w}.{verb}", problems)
+            at, of = v.get("at"), v.get("of")
+            if not (isinstance(at, list) and len(at) == 2 and all(_num(x) and 0 <= x <= 1 for x in at)):
+                problems.append(f"{w}.{verb}.at: must be [fx, fy], fractions (0 to 1) of the element's box "
+                                f"([0.5, 0.5] is its centre)")
+            if not (isinstance(of, str) and of.strip()):
+                problems.append(f"{w}.{verb}.of: required, a CSS selector for the element whose box 'at' is in")
+        elif verb in ("js", "click", "waitFor", "css", "type", "stable") and not isinstance(v, str):
+            problems.append(f"{w}.{verb}: must be a string" + (
+                " (a CSS selector), or {\"at\": [fx, fy], \"of\": \"css\"}" if verb == "click" else
+                " (a CSS selector; waits until its box stops moving)" if verb == "stable" else ""))
         elif verb == "mark" and v not in ("in", "out"):
             problems.append(f"{w}.mark: must be 'in' or 'out' (trims a clip to the frames between)")
         elif verb == "key":
@@ -446,7 +520,9 @@ def validate_steps(steps, where: str, adapter: str, problems: list[str], kind: s
                 problems.append(f"{w}.action: must be down, up or press")
         elif verb == "tap" and not (isinstance(v, str) and v.strip()
                                     or isinstance(v, list) and len(v) == 2 and all(_num(x) for x in v)):
-            problems.append(f"{w}.tap: must be [x, y] in CSS pixels or a CSS selector (tapped at its centre)")
+            if not isinstance(v, dict):
+                problems.append(f"{w}.tap: must be [x, y] in CSS pixels or a CSS selector (tapped at its centre), "
+                                f"or {{\"at\": [fx, fy], \"of\": \"css\"}} (fractions of the element's box)")
         elif verb in ("wait", "frames") and not (_num(v) and v >= 0):
             problems.append(f"{w}.{verb}: must be a non-negative number")
         elif verb == "goto" and not (isinstance(v, str) and v.strip()):
@@ -458,8 +534,9 @@ def validate_steps(steps, where: str, adapter: str, problems: list[str], kind: s
                 if kind != "still":
                     problems.append(f"{w}.capture: a named capture ('{v}') makes a still file; in a "
                                     f"{kind} use {{\"capture\": true}}")
-                elif not CAPTURE_NAME.fullmatch(v):
-                    problems.append(f"{w}.capture: '{v}' is not a file name; letters, digits, '.', '_' and '-' only")
+                elif not CAPTURE_NAME.fullmatch(_VAR.sub("x", v)):
+                    problems.append(f"{w}.capture: '{v}' is not a file name; letters, digits, '.', '_' and '-' only "
+                                    f"(and {{var}} placeholders)")
             elif v is not True:
                 problems.append(f"{w}.capture: must be true (a clip frame) or a name (a still written as NAME.jpg)")
         elif verb == "camera":
@@ -485,6 +562,10 @@ def validate_steps(steps, where: str, adapter: str, problems: list[str], kind: s
             if "steps" not in st:
                 problems.append(f"{w}.steps: required, the steps to repeat")
             validate_steps(st.get("steps", []), f"{w}.steps", adapter, problems, kind)
+        if "force" in st and not isinstance(st["force"], bool):
+            problems.append(f"{w}.force: must be true or false (true skips Playwright's actionability checks)")
+        if verb == "stable" and "timeout" in st and not (_num(st["timeout"]) and st["timeout"] > 0):
+            problems.append(f"{w}.timeout: must be a positive number of milliseconds")
         if verb == "frames" and "step" in st:
             if adapter != "strata-kit":
                 problems.append(f"{w}.step: only the strata-kit adapter drives a clock; drop 'step'")
@@ -573,16 +654,8 @@ def validate(data: Any) -> list[str]:
     _check_keys(data, TOP_KEYS, "manifest", p)
     if "out" in data and not isinstance(data["out"], str):
         p.append("out: must be a path relative to the manifest")
-    vars_ = data.get("vars", {})
-    if not isinstance(vars_, dict):
-        p.append("vars: must be an object of name -> value")
-    else:
-        for k, v in vars_.items():
-            if isinstance(v, list):
-                if not all(isinstance(x, (str, int, float)) and not isinstance(x, bool) for x in v):
-                    p.append(f"vars.{k}: a list var holds strings or numbers only (it splices into argv as '@{k}')")
-            elif isinstance(v, (dict, bool)) or v is None:
-                p.append(f"vars.{k}: must be a string, a number, or a list of them")
+    _validate_vars(data.get("vars", {}), "vars", p)
+    _validate_top_gallery(data.get("gallery"), p)
     devices = data.get("devices", {})
     if not isinstance(devices, dict):
         p.append("devices: must be an object of name -> {width, height, ...}")
@@ -610,8 +683,8 @@ def validate(data: Any) -> list[str]:
     if p:
         return p
     m = Manifest(Path("manifest.json"), data, dict(data.get("vars", {})))
-    known_vars = set(data.get("vars", {})) | BUILTIN_VARS
-    list_vars = {k for k, v in data.get("vars", {}).items() if isinstance(v, list)}
+    top_known = set(data.get("vars", {})) | BUILTIN_VARS
+    list_vars: set[str] = set()
 
     def no_list_in_strings(value, where):
         for name in sorted(placeholders(value) & list_vars):
@@ -651,6 +724,13 @@ def validate(data: Any) -> list[str]:
                 appended.add(k)
         backend = s.get("backend", "web")
         allowed = set(COMMON_SHOT_KEYS) | appended
+        # A shot's own vars are merged over the manifest's.
+        own_vars = s.get("vars") if isinstance(s.get("vars"), dict) else {}
+        if "vars" in s:
+            _validate_vars(s["vars"], f"{w}.vars", p)
+        known_vars = top_known | set(own_vars)
+        merged_vars = {**data.get("vars", {}), **own_vars}
+        list_vars = {k for k, v in merged_vars.items() if isinstance(v, list)}
         if kind == "grid":
             allowed |= GRID_KEYS
             _validate_grid(s, w, all_names, composites, p)
@@ -676,7 +756,9 @@ def validate(data: Any) -> list[str]:
                 continue
             allowed |= WEB_KEYS if backend == "web" else COMMAND_KEYS
             dev = s.get("device", "desktop")
-            if isinstance(dev, str) and dev not in DEVICES and dev not in devices:
+            if isinstance(dev, str) and placeholders(dev):
+                _validate_device_template(s, w, dev, merged_vars, known_vars, devices, p)
+            elif isinstance(dev, str) and dev not in DEVICES and dev not in devices:
                 p.append(f"{w}.device: unknown device '{dev}'{_suggest(dev, list(DEVICES) + list(devices))}")
             elif isinstance(dev, dict):
                 _check_keys(dev, DEVICE_KEYS, f"{w}.device", p)
@@ -697,9 +779,10 @@ def validate(data: Any) -> list[str]:
                         p.append(f"{w}.frameStep: only the strata-kit adapter drives a clock")
                     elif not (_num(s["frameStep"]) and s["frameStep"] > 0):
                         p.append(f"{w}.frameStep: must be a positive number of seconds per frame (default 1/30)")
-                if kind == "still" and "each" in s and _named_captures(s):
-                    p.append(f"{w}.each: named captures and 'each' don't mix; make one shot per value "
-                             f"or drop the names")
+                _validate_capture_names(s, w, kind, known_vars, p)
+                _validate_console(s, w, p)
+                if "session" in s:
+                    _validate_session_key(s, w, p)
                 css = s.get("css")
                 if css is not None and not isinstance(css, str):
                     p.append(f"{w}.css: must be a string of CSS")
@@ -713,6 +796,8 @@ def validate(data: Any) -> list[str]:
                     p.append(f"{w}.outputs: only command shots map written files to outputs; a web "
                              f"still names its images with {{\"capture\": \"NAME\"}} steps")
             else:
+                if "session" in s:
+                    allowed.add("session")  # reported (pointedly) by _session_conflicts
                 argv = s.get("argv")
                 if not (isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv)):
                     p.append(f"{w}.argv: required, a non-empty list of strings")
@@ -837,7 +922,143 @@ def validate(data: Any) -> list[str]:
             p.append(f"{w}.retries: must be a non-negative integer")
         _check_lock_timeout(s, w, p)
     p += _dependency_cycles(m.shots)
+    p += _session_conflicts(m)
     return p
+
+
+def _validate_vars(vars_, where: str, p: list[str]) -> None:
+    if not isinstance(vars_, dict):
+        p.append(f"{where}: must be an object of name -> value")
+        return
+    for k, v in vars_.items():
+        if isinstance(v, list):
+            if not all(isinstance(x, (str, int, float)) and not isinstance(x, bool) for x in v):
+                p.append(f"{where}.{k}: a list var holds strings or numbers only (it splices into argv as '@{k}')")
+        elif isinstance(v, (dict, bool)) or v is None:
+            p.append(f"{where}.{k}: must be a string, a number, or a list of them")
+        if k in BUILTIN_VARS and where != "vars":
+            p.append(f"{where}.{k}: '{k}' is set by darkroom itself; pick another name")
+
+
+def _validate_top_gallery(g, p: list[str]) -> None:
+    if g is None:
+        return
+    if not isinstance(g, dict):
+        p.append('gallery: must be an object like {"layout": "table", "by": "device"}')
+        return
+    _check_keys(g, TOP_GALLERY_KEYS, "gallery", p)
+    if g.get("layout", "list") not in GALLERY_LAYOUTS:
+        p.append(f"gallery.layout: must be one of {', '.join(GALLERY_LAYOUTS)}"
+                 f"{_suggest(str(g.get('layout')), GALLERY_LAYOUTS)}")
+    if "by" in g and g["by"] not in GALLERY_BY:
+        p.append(f"gallery.by: must be 'device' (one column per device)")
+    if "by" in g and g.get("layout", "list") != "table":
+        p.append("gallery.by: only for \"layout\": \"table\"")
+    widths = g.get("widths")
+    if widths is not None and not (isinstance(widths, dict) and all(
+            isinstance(v, int) and not isinstance(v, bool) and v > 0 for v in widths.values())):
+        p.append('gallery.widths: must be an object of device name -> image width in pixels, '
+                 'e.g. {"phone": 200, "desktop": 480}')
+
+
+def _validate_device_template(s: dict, w: str, dev: str, merged_vars: dict, known_vars: set,
+                              devices: dict, p: list[str]) -> None:
+    """``"device": "{value}"`` (or ``"{dev}"``): every value it can take must name a device."""
+    unknown = placeholders(dev) - known_vars
+    if unknown:
+        for u in sorted(unknown):
+            p.append(f"{w}.device: unknown variable '{{{u}}}'{_suggest(u, known_vars)}")
+        return
+    run_dependent = placeholders(dev) & {"value", "i", "n"}
+    each = s.get("each") if isinstance(s.get("each"), list) else None
+    if run_dependent and not each:
+        p.append(f"{w}.device: '{dev}' uses {{{sorted(run_dependent)[0]}}}, which only 'each' sets")
+        return
+    if placeholders(dev) - {"value", "i", "n"} - set(merged_vars):
+        return  # a built-in filled in at run time; nothing to check here
+    variables = expand_vars({k: v for k, v in merged_vars.items()})
+    known = list(DEVICES) + list(devices)
+    for i, value in enumerate(each or [None]):
+        run = dict(variables, **({"value": value, "i": i, "n": len(each)} if each else {}))
+        name = str(template(dev, run))
+        if name not in known:
+            why = f" for each value '{value}'" if each else ""
+            p.append(f"{w}.device: '{dev}' gives '{name}'{why}, which is not a device{_suggest(name, known)} "
+                     f"(known: {', '.join(known)})")
+
+
+def _validate_capture_names(s: dict, w: str, kind: str, known_vars: set, p: list[str]) -> None:
+    names = _named_captures(s)
+    for n in names:
+        for u in sorted(placeholders(n) - known_vars):
+            p.append(f"{w}: capture name '{n}': unknown variable '{{{u}}}'{_suggest(u, known_vars)}")
+    if kind == "still" and "each" in s and names:
+        fixed = [n for n in names if not placeholders(n) & {"value", "i"}]
+        if fixed:
+            p.append(f"{w}.each: capture name '{fixed[0]}' would be written once per value; with 'each', "
+                     f"put {{value}} (or {{i}}) in every capture name, e.g. '{fixed[0]}-{{value}}'")
+    if "session" in s and s.get("each"):
+        p.append(f"{w}.session: 'each' opens a fresh page per value, so it cannot share a session; "
+                 f"drop one of them")
+
+
+def _validate_console(s: dict, w: str, p: list[str]) -> None:
+    if "failOnConsole" in s:
+        v = s["failOnConsole"]
+        if not (isinstance(v, list) and all(isinstance(t, str) for t in v)):
+            p.append(f"{w}.failOnConsole: must be a list of console message types, e.g. [\"error\", \"warning\"]")
+        else:
+            for t in v:
+                if t not in CONSOLE_TYPES:
+                    p.append(f"{w}.failOnConsole: unknown console type '{t}'{_suggest(t, CONSOLE_TYPES)}; "
+                             f"use error, warning, info, log, debug, ...")
+    if "failOnConsoleError" in s and not isinstance(s["failOnConsoleError"], bool):
+        p.append(f"{w}.failOnConsoleError: must be true or false (the same as \"failOnConsole\": [\"error\"])")
+
+
+def _validate_session_key(s: dict, w: str, p: list[str]) -> None:
+    v = s["session"]
+    if not (isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", v)):
+        p.append(f"{w}.session: must be a name (letters, digits, '.', '_' and '-'); consecutive web shots "
+                 f"with the same session share one page")
+
+
+def session_signature(m: Manifest, shot: Shot) -> dict:
+    """What every shot of one session must agree on (the page is opened once, with these)."""
+    variables = m.shot_vars(shot)
+    sig = {k: template(shot.raw.get(k), variables) for k in SESSION_FIELDS if k != "device"}
+    try:
+        sig["device"] = m.shot_device(shot)
+    except KeyError:
+        sig["device"] = shot.raw.get("device")
+    return sig
+
+
+def _session_conflicts(m: Manifest) -> list[str]:
+    first: dict[str, tuple[Shot, dict]] = {}
+    problems = []
+    for shot in m.shots:
+        name = shot.raw.get("session")
+        if not isinstance(name, str) or shot.backend != "web" or shot.composite:
+            if isinstance(name, str) and shot.backend == "command":
+                problems.append(f"shots[{shot.index}] ({shot.raw.get('name')}).session: only web shots share a "
+                                f"page; drop 'session'")
+            continue
+        try:
+            sig = session_signature(m, shot)
+        except Exception:  # noqa: BLE001 - reported elsewhere (a bad device or var)
+            continue
+        if name not in first:
+            first[name] = (shot, sig)
+            continue
+        lead, lead_sig = first[name]
+        for k in SESSION_FIELDS:
+            if sig.get(k) != lead_sig.get(k):
+                problems.append(f"shots[{shot.index}] ({shot.raw.get('name')}).{k}: differs from '{lead.raw.get('name')}', "
+                                f"the first shot of session '{name}'; shots in one session share one page, so "
+                                f"{k} must be the same (or use another session name)")
+                break
+    return problems
 
 
 def _check_lock_timeout(s: dict, w: str, p: list[str]) -> None:
@@ -1015,7 +1236,7 @@ def lint(m: Manifest) -> list[str]:
     made = set()
     for s in m.shots:
         if s.prep and isinstance(s.get("outputs"), list):
-            made |= {os.path.normpath(str(o)) for o in template(s["outputs"], m.vars)}
+            made |= {os.path.normpath(str(o)) for o in template(s["outputs"], m.shot_vars(s))}
 
     def missing(rel: str, base: Path) -> bool:
         path = os.path.normpath(os.path.join(str(base), rel))
@@ -1028,13 +1249,13 @@ def lint(m: Manifest) -> list[str]:
             continue
         w = f"shots[{s.index}] ({s.name})"
         if s.backend == "command" and isinstance(s.get("argv"), list):
-            argv = expand_argv(s["argv"], m.vars)
+            argv = expand_argv(s["argv"], m.shot_vars(s))
             cwd = s.get("cwd")
             if cwd is None:  # relative paths are anchored to the manifest's folder
                 base = m.dir
                 where = "the manifest's folder"
             else:
-                cwd = template(cwd, m.vars)
+                cwd = template(cwd, m.shot_vars(s))
                 if placeholders(cwd):
                     base = None  # {work_dir} etc.: only known at run time
                 else:
@@ -1057,12 +1278,12 @@ def lint(m: Manifest) -> list[str]:
                         warnings.append(f"{w}.argv[{k}]: '{shown}' does not exist")
                 elif base is not None and missing(a, base):
                     warnings.append(f"{w}.argv[{k}]: '{a}' does not exist (relative to {where})")
-        for j, pat in enumerate(template(s.get("inputs") or [], m.vars)):
+        for j, pat in enumerate(template(s.get("inputs") or [], m.shot_vars(s))):
             if not isinstance(pat, str) or placeholders(pat):
                 continue
             if expand_input(m.dir, pat)[0][1] is None and os.path.normpath(pat) not in made:
                 warnings.append(f"{w}.inputs[{j}]: '{pat}' matches no files (yet)")
-        for f in init_files(s.get("initScript"), m.vars):
+        for f in init_files(s.get("initScript"), m.shot_vars(s)):
             if not placeholders(f) and not (m.dir / f).is_file():
                 warnings.append(f"{w}.initScript: file '{f}' does not exist (relative to the manifest)")
     return warnings

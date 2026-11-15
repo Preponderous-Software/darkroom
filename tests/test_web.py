@@ -122,3 +122,97 @@ def test_init_script_and_context(server, write_manifest):
     logs = []
     assert shoot(load(p), log=logs.append) == 0, logs
     assert (p.parent / "media/seeded.jpg").exists()
+
+
+# ------------------------------------------------------------------ 0.6
+
+STEPS_PAGE = """<!doctype html><html><body style="margin:0">
+<canvas id="c" width="320" height="180" style="display:block"></canvas>
+<div id="mover" style="position:absolute;left:0;top:200px;width:40px;height:20px;background:#f80"></div>
+<button id="spin" style="position:absolute;left:100px;top:240px;width:80px;height:40px;
+  animation:spin 0.5s linear infinite">spin</button>
+<style>@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}</style>
+<script>
+document.getElementById('c').addEventListener('click', (e) => { window.hit = [e.clientX, e.clientY]; });
+document.getElementById('spin').addEventListener('click', () => { window.spun = (window.spun || 0) + 1; });
+const mover = document.getElementById('mover'), t0 = performance.now();
+(function step(t) {
+  const x = Math.min(200, (t - t0) / 3);
+  mover.style.left = x + 'px';
+  if (x < 200) requestAnimationFrame(step); else window.moverDone = true;
+})(t0);
+console.warn('low on memory (pretend)');
+console.log('booted', 1);
+</script></body></html>"""
+
+
+def _site(server, tmp_path, name, text):
+    (tmp_path / "site" / name).write_text(text)
+    return server + name
+
+
+@pytest.mark.skipif(not playwright_available(), reason="Node Playwright not resolvable (set NODE_PATH)")
+def test_console_log_stable_tap_at_and_force(server, tmp_path, write_manifest):
+    url = _site(server, tmp_path, "steps.html", STEPS_PAGE)
+    dev = {"width": 320, "height": 300}
+    p = write_manifest({"shots": [
+        {"name": "steps", "url": url, "device": dev, "retries": 0, "steps": [
+            {"stable": "#mover", "timeout": 10000}, {"waitFor": "window.moverDone === true", "timeout": 1000},
+            {"tap": {"at": [0.25, 0.5], "of": "#c"}},
+            {"waitFor": "window.hit && window.hit[0] === 80 && window.hit[1] === 90", "timeout": 5000},
+            {"click": {"at": [0.5, 0.1], "of": "#c"}},
+            {"waitFor": "window.hit[0] === 160 && window.hit[1] === 18", "timeout": 5000},
+            {"click": "#spin", "force": True}, {"waitFor": "window.spun === 1", "timeout": 5000}]},
+        {"name": "strict", "url": url, "device": dev, "retries": 0, "failOnConsole": ["warning"]}]})
+    logs = []
+    assert shoot(load(p), log=logs.append) == 1
+    assert any("strict: FAILED" in l and "1 console warning(s) and failOnConsole is set" in l for l in logs), logs
+    assert not any("steps: FAILED" in l for l in logs), logs
+    lines = [json.loads(l) for l in (p.parent / ".darkroom/takes/steps/console.jsonl").read_text().splitlines()]
+    by_type = {c["type"]: c for c in lines}
+    assert by_type["warning"]["text"] == "low on memory (pretend)"
+    assert by_type["log"]["text"] == "booted 1"
+    assert by_type["log"]["location"]["url"].endswith("steps.html") and "T" in by_type["log"]["time"]
+    meta = json.loads((p.parent / ".darkroom/takes/steps/meta.json").read_text())
+    assert meta["console"] == {"warning": 1, "log": 1} and meta["consoleErrors"] == []
+
+
+@pytest.mark.skipif(not playwright_available(), reason="Node Playwright not resolvable (set NODE_PATH)")
+def test_session_shares_one_page_and_a_failure_starts_fresh(server, write_manifest):
+    p = write_manifest({"vars": {"base": server}, "defaults": {
+        "url": "{base}index.html", "session": "game", "device": {"width": 160, "height": 90}, "retries": 0,
+        "setup": [{"js": "window.setups = (window.setups || 0) + 1"}]}, "shots": [
+        {"name": "one", "steps": [{"js": "window.k = 1"}]},
+        {"name": "two", "steps": [{"waitFor": "window.k === 1 && window.setups === 1", "timeout": 3000},
+                                  {"js": "window.k = 2"}]},
+        {"name": "broken", "steps": [{"waitFor": "false", "timeout": 500}]},
+        {"name": "fresh", "steps": [{"waitFor": "window.k === undefined && window.setups === 1", "timeout": 3000}]},
+        {"name": "alone", "session": "other", "steps": [{"waitFor": "window.k === undefined", "timeout": 3000}]}]})
+    logs = []
+    assert shoot(load(p), log=logs.append) == 1, logs
+    assert any("broken: FAILED" in l for l in logs)
+    assert sum("session game: opening the page" in l for l in logs) == 2, logs  # once, then after the failure
+    for name in ("one", "two", "fresh", "alone"):
+        assert (p.parent / f"media/{name}.jpg").exists(), name
+        assert json.loads((p.parent / f".darkroom/takes/{name}/meta.json").read_text()).get("session") in ("game", "other")
+    # state and hashes stay per shot: a second run skips them all, without opening a page
+    logs.clear()
+    assert shoot(load(p), only=["one", "two"], log=logs.append) == 0
+    assert all(l.startswith("= ") for l in logs), logs
+
+
+@pytest.mark.skipif(not playwright_available(), reason="Node Playwright not resolvable (set NODE_PATH)")
+def test_each_over_devices_with_named_captures(server, write_manifest):
+    p = write_manifest({"vars": {"base": server}, "devices": {"small": {"width": 120, "height": 90},
+                                                               "wide": {"width": 200, "height": 90}},
+                        "shots": [{"name": "screens", "url": "{base}index.html", "retries": 0,
+                                   "each": ["small", "wide"], "device": "{value}",
+                                   "steps": [{"capture": "title-{value}"}, {"js": "window.x = 1"},
+                                             {"capture": "map-{value}"}]}]})
+    assert shoot(load(p)) == 0
+    for name, w in (("title-small", 120), ("map-small", 120), ("title-wide", 200), ("map-wide", 200)):
+        with Image.open(p.parent / f"media/{name}.jpg") as im:
+            assert im.size == (w, 90), name
+    state = json.loads((p.parent / ".darkroom/state.json").read_text())
+    assert [(c["row"], c["device"]) for c in state["screens"]["cells"]] == [
+        ("title", "small"), ("map", "small"), ("title", "wide"), ("map", "wide")]

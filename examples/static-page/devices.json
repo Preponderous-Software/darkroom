@@ -1,0 +1,24 @@
+{
+  "description": "Screens x devices without copying shots: one shot loops over three devices and names a capture per screen; the gallery lays them out as a table, one column per device.",
+  "out": "media/devices",
+  "vars": { "page": "file://{manifest_dir}/index.html" },
+  "devices": { "tablet": { "width": 820, "height": 1180, "dpr": 2, "touch": true, "mobile": true } },
+  "gallery": { "layout": "table", "by": "device" },
+  "shots": [
+    {
+      "name": "screens", "kind": "still",
+      "each": ["phone", "tablet", "desktop"], "device": "{value}",
+      "url": "{page}?theme=safelight", "ready": "window.demo && window.demo.ready",
+      "failOnConsole": ["error", "warning"],
+      "alt": "The demo page",
+      "steps": [
+        { "js": "demo.at(2)" },
+        { "capture": "drying-{value}" },
+        { "stable": "#btn", "timeout": 10000 },
+        { "tap": { "at": [0.5, 0.5], "of": "#btn" } },
+        { "waitFor": "document.body.dataset.developed === '1'", "timeout": 5000 },
+        { "capture": "developed-{value}" }
+      ]
+    }
+  ]
+}

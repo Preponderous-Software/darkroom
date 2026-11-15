@@ -24,6 +24,16 @@ def _vars(pairs):
     return out
 
 
+def _positive(v: str) -> int:
+    try:
+        n = int(v)
+    except ValueError:
+        n = 0
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be a whole number of 1 or more (got '{v}')")
+    return n
+
+
 def _load(args):
     try:
         return load(args.manifest, _vars(getattr(args, "var", None)))
@@ -57,8 +67,12 @@ def cmd_shoot(args):
             print(f"warning: another darkroom run is shooting {args.manifest} ({', '.join(others)}); "
                   "takes of the same shot will collide", file=sys.stderr)
         try:
+            if args.adopt:
+                from .shoot import adopt
+                adopt(m, only=args.only, tag=args.tag)
+                return 0
             failed = shoot(m, only=args.only, tag=args.tag, retries=args.retries, force=args.force,
-                           encode_only=args.encode)
+                           encode_only=args.encode, jobs=args.jobs)
         except (KeyboardInterrupt, procs.Stopped) as e:
             why = "interrupted" if isinstance(e, KeyboardInterrupt) else f"stopped ({e})"
             print(f"darkroom run {run.id} {why}; its processes were stopped", file=sys.stderr)
@@ -71,19 +85,20 @@ def cmd_shoot(args):
 def cmd_gallery(args):
     m = _load(args)
     rel = Path(args.relative_to).resolve() if args.relative_to else None
+    layout = gallery.Layout.of(m, args.layout, args.by)
     try:
         if args.format == "html":
             target = Path(args.write or (m.out_dir / "index.html")).resolve()
-            page = gallery.html_page(m, target, args.only, args.title, base_url=args.base_url)
+            page = gallery.html_page(m, target, args.only, args.title, base_url=args.base_url, layout=layout)
             target.write_text(page)
             print(target)
             return 0
         if args.insert:
-            done = gallery.update_doc(m, Path(args.insert), args.only, base_url=args.base_url)
+            done = gallery.update_doc(m, Path(args.insert), args.only, base_url=args.base_url, layout=layout)
             print(f"updated {args.insert}: {', '.join(done) if done else 'nothing shot yet'}")
             return 0
         text = gallery.markdown(m, rel or (Path(args.write).resolve() if args.write else None), args.only,
-                                base_url=args.base_url)
+                                base_url=args.base_url, layout=layout)
     except gallery.GalleryError as e:
         print(f"gallery: {e}", file=sys.stderr)
         return 2
@@ -169,6 +184,23 @@ def _take_manifest(take: Path) -> tuple[Path | None, str | None]:
     return project, out
 
 
+def _takes_hint(path: Path, depth: int = 4) -> str:
+    """Where takes named like PATH really are: takes live in ``.darkroom/takes`` beside each
+    manifest (e.g. ``tools/capture/.darkroom/takes/X``), not necessarily at the repo root."""
+    name = path.name
+    found: list[str] = []
+    for d in range(depth + 1):
+        pattern = "/".join(["*"] * d + [".darkroom", "takes", name or "*"])
+        found += [str(p) for p in Path(".").glob(pattern) if p.is_dir()]
+        if len(found) >= 5:
+            break
+    if found:
+        return ("; takes live beside their manifest, in .darkroom/takes. Found: " + ", ".join(sorted(found)[:5])
+                + " (or run: darkroom sheet MANIFEST SHOT)")
+    return ("; takes live beside their manifest, in <manifest dir>/.darkroom/takes/<shot>, and none named "
+            f"'{name}' are under this folder; try: darkroom sheet MANIFEST SHOT")
+
+
 def cmd_sheet(args):
     labels = args.labels
     if args.manifest.endswith(".json"):
@@ -186,6 +218,9 @@ def cmd_sheet(args):
         out = Path(args.out) if args.out else m.out_dir / f"{key}-sheet.png"
     else:  # a take folder, or any folder of images
         folder = Path(args.manifest).resolve()
+        if not folder.is_dir():
+            print(f"sheet: {args.manifest}: no such folder" + _takes_hint(Path(args.manifest)), file=sys.stderr)
+            return 2
         project, out_rel = _take_manifest(folder)
         meta = {}
         if project is not None:
@@ -232,6 +267,11 @@ def main(argv=None):
     p.add_argument("--encode", action="store_true", help="re-encode the last takes without reshooting")
     p.add_argument("--out", metavar="DIR", help="write every output (including 'file' ones) into DIR "
                    "instead, e.g. a scratch dir for review; the takes are shared")
+    p.add_argument("--adopt", action="store_true", help="shoot nothing: record shots whose outputs all "
+                   "exist (e.g. committed, in a fresh checkout) as up to date for their current hashes")
+    p.add_argument("--jobs", "-j", type=_positive, default=1, metavar="N",
+                   help="run up to N independent shots at once (default 1); shots with the same lock "
+                   "never overlap, dependents wait, and one session's shots run in order")
     p.set_defaults(fn=cmd_shoot)
 
     p = sub.add_parser("ps", help="list this user's running darkroom shoots (stale entries are pruned)")
@@ -257,6 +297,9 @@ def main(argv=None):
                    "outside the repo")
     p.add_argument("--only", nargs="+", action="extend", metavar="NAME")
     p.add_argument("--title", default="Media")
+    p.add_argument("--layout", choices=["list", "table"], help="list (default: one shot after another) or "
+                   "table (rows of screens, one column per device); the manifest's gallery.layout is the default")
+    p.add_argument("--by", choices=["device"], help="the table's columns (device)")
     p.set_defaults(fn=cmd_gallery)
 
     p = sub.add_parser("pair", help="compose before/after takes of a shot side by side")

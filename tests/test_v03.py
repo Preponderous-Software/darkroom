@@ -267,7 +267,8 @@ def test_new_steps_validate():
     e = errors({"steps": [{"reload": 1}, {"tap": 5}]})
     assert any("reload: must be true" in x for x in e) and any("or a CSS selector" in x for x in e)
     e = errors({"each": ["a", "b"], "steps": [{"capture": "x"}]})
-    assert any("named captures and 'each' don't mix" in x for x in e)
+    # 0.6 (#15): each and named captures mix, when every name has {value} (or {i}) in it
+    assert any("capture name 'x' would be written once per value" in x for x in e)
 
 
 def test_new_options_validate():

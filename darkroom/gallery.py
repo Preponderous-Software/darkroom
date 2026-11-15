@@ -6,8 +6,10 @@ import os
 import re
 from pathlib import Path
 
-from .manifest import Manifest
-from .shoot import State, output_base
+from dataclasses import dataclass, field
+
+from .manifest import Manifest, placeholders
+from .shoot import State, device_label, output_base, strip_device
 
 START, END = "<!-- darkroom:start -->", "<!-- darkroom:end -->"
 # <!-- darkroom:shot NAME --> ... <!-- darkroom:end -->, or self-closing <!-- darkroom:shot NAME /-->
@@ -266,20 +268,27 @@ def shot_markdown(m: Manifest, shot, outs: list[Path], link) -> list[str]:
 
 
 def markdown(m: Manifest, relative_to: Path | None = None, only=None, heading: str | None = None,
-             base_url: str | None = None) -> str:
+             base_url: str | None = None, layout: Layout | None = None) -> str:
     link = Linker(m, relative_to.parent if relative_to else m.dir, base_url)
     lines: list[str] = []
     if heading:
         lines += [heading, ""]
-    for shot, outs in entries(m, only):
+    cells, rest = _split_table(m, entries(m, only), layout or Layout())
+    if cells:
+        lines += [table_html(m, cells, link, layout), ""]
+    for shot, outs in rest:
         lines += shot_markdown(m, shot, outs, link)
     return "\n".join(lines).rstrip() + "\n"
 
 
-def html_page(m: Manifest, relative_to: Path, only=None, title: str = "Media", base_url: str | None = None) -> str:
+def html_page(m: Manifest, relative_to: Path, only=None, title: str = "Media", base_url: str | None = None,
+              layout: Layout | None = None) -> str:
     link = Linker(m, relative_to.parent, base_url)
     cards = []
-    for shot, outs in entries(m, only):
+    cells, rest = _split_table(m, entries(m, only), layout or Layout())
+    table = (f'<div class="table">{table_html(m, cells, link, layout, cls=" class=devices")}</div>'
+             if cells else "")
+    for shot, outs in rest:
         alt = html.escape(shot.get("alt") or shot.get("caption") or shot.name)
         c = classify(outs)
         named = named_stills(m, shot, c["stills"]) if shot.named_outputs() else []
@@ -320,10 +329,142 @@ main{{display:grid;gap:16px;grid-template-columns:repeat(auto-fill,minmax(min(10
 figure{{margin:0;background:var(--card);border-radius:8px;overflow:hidden}}
 img,video{{display:block;width:100%;height:auto}}
 figcaption{{padding:8px 12px;color:var(--muted)}} figcaption b{{color:var(--fg)}}
-</style></head><body><h1>{html.escape(title)}</h1><main>
+.table{{overflow-x:auto;max-width:1400px;margin:0 auto 16px}}
+table.devices{{border-collapse:collapse;background:var(--card);border-radius:8px}}
+table.devices th,table.devices td{{padding:8px;vertical-align:top;text-align:left}}
+table.devices th{{color:var(--muted);font-weight:600}}
+table.devices img{{max-width:none;height:auto;border-radius:4px}}
+</style></head><body><h1>{html.escape(title)}</h1>{table}<main>
 {chr(10).join(cards)}
 </main></body></html>
 """
+
+
+# ------------------------------------------------------------------ table layout (#18)
+
+TABLE_WIDTH = 880  # about the width of a GitHub PR body or README column, in pixels
+MAX_CELL_WIDTH = 640
+
+
+@dataclass
+class Layout:
+    """How the gallery lays shots out: ``list`` (one after another) or ``table`` (rows of
+    screens, one column per device). The manifest's ``gallery`` sets the default."""
+    kind: str = "list"
+    by: str = "device"
+    widths: dict = field(default_factory=dict)
+
+    @classmethod
+    def of(cls, m: Manifest, layout: str | None = None, by: str | None = None) -> "Layout":
+        g = m.data.get("gallery") if isinstance(m.data.get("gallery"), dict) else {}
+        return cls(layout or g.get("layout", "list"), by or g.get("by", "device"), dict(g.get("widths") or {}))
+
+    @property
+    def table(self) -> bool:
+        return self.kind == "table"
+
+
+@dataclass
+class Cell:
+    shot: object
+    row: str
+    device: str
+    path: Path
+    alt: str
+
+
+def shot_cells(m: Manifest, state: State, shot, outs: list[Path]) -> list[Cell]:
+    """The stills of a shot as table cells (row = screen, device = column). Empty for a shot that
+    does not fit a table (clips, pairs, grids), so it is shown as a list instead."""
+    if shot.kind != "still" or shot.composite:
+        return []
+    alt = (shot.get("alt") or shot.get("caption") or shot.name).replace("]", ")").replace("\n", " ")
+    entry = state.get(shot.name) or {}
+    if entry.get("cells"):
+        return [Cell(shot, c["row"], c["device"], m.dir / c["file"], f"{alt} ({c['row']}, {c['device']})")
+                for c in entry["cells"] if (m.dir / c["file"]).exists()]
+    # No cells recorded (outputs from before 0.6): work them out, when the device is fixed.
+    dev = shot.get("device", "desktop")
+    if isinstance(dev, str) and placeholders(dev):
+        return []
+    device = device_label(m, shot)
+    stills = classify(outs)["stills"]
+    named = named_stills(m, shot, stills) if shot.named_outputs() else []
+    gal = shot.get("gallery") if isinstance(shot.get("gallery"), dict) else {}
+    if named:
+        rows = [(p, key) for p, key, _ in named]
+    elif shot.get("each") and len(stills) == len(shot["each"]):
+        rows = list(zip(stills, [str(v) for v in shot["each"]]))
+    elif len(stills) == 1:
+        rows = [(stills[0], gal.get("row") or shot.name)]
+    else:
+        rows = [(p, p.stem) for p in stills]
+    out = []
+    for p, row in rows:
+        row = strip_device(str(row), device) or gal.get("row") or shot.name
+        out.append(Cell(shot, row, device, p, f"{alt} ({row}, {device})"))
+    return out
+
+
+def _aspect(m: Manifest, device: str) -> float:
+    try:
+        d = m.device(device)
+    except KeyError:
+        mt = re.fullmatch(r"(\d+)x(\d+)", device)
+        d = {"width": int(mt.group(1)), "height": int(mt.group(2))} if mt else {"width": 16, "height": 9}
+    return d["width"] / d["height"]
+
+
+def column_widths(m: Manifest, devices: list[str], layout: Layout) -> dict[str, int]:
+    """Image width per column: the manifest's ``gallery.widths``, else widths that give every
+    column the same image height and fill about ``TABLE_WIDTH`` pixels."""
+    aspects = {d: _aspect(m, d) for d in devices}
+    h = TABLE_WIDTH / max(sum(aspects.values()), 1e-6)
+    return {d: int(layout.widths.get(d) or min(MAX_CELL_WIDTH, max(80, round(aspects[d] * h)))) for d in devices}
+
+
+def table_grid(cells: list[Cell]) -> tuple[list[str], list[str], dict]:
+    rows, devices, grid = [], [], {}
+    for c in cells:
+        if c.row not in rows:
+            rows.append(c.row)
+        if c.device not in devices:
+            devices.append(c.device)
+        grid.setdefault((c.row, c.device), c)
+    return rows, devices, grid
+
+
+def table_html(m: Manifest, cells: list[Cell], link, layout: Layout, cls: str = "") -> str:
+    """An HTML table (GitHub renders it in markdown): a row per screen, a column per device."""
+    rows, devices, grid = table_grid(cells)
+    widths = column_widths(m, devices, layout)
+    head = "<tr><th></th>" + "".join(f"<th>{html.escape(d)}</th>" for d in devices) + "</tr>"
+    style = ' style="width:{w}px"' if cls else ""  # the page's own CSS sizes images to 100%
+    lines = [f"<table{cls}>", head]
+    for r in rows:
+        tds = []
+        for d in devices:
+            c = grid.get((r, d))
+            tds.append(f'<td><img src="{html.escape(link(c.path))}" alt="{html.escape(c.alt)}" '
+                       f'width="{widths[d]}"{style.format(w=widths[d])}></td>' if c else "<td></td>")
+        lines.append(f"<tr><td><b>{html.escape(r)}</b></td>" + "".join(tds) + "</tr>")
+    lines.append("</table>")
+    return "\n".join(lines)
+
+
+def _split_table(m: Manifest, items, layout: Layout):
+    """(cells for the table, the (shot, outs) to show as a list)."""
+    if not layout.table:
+        return [], list(items)
+    state = State(m)
+    cells, rest = [], []
+    for shot, outs in items:
+        got = shot_cells(m, state, shot, outs)
+        if got:
+            cells += got
+        else:
+            rest.append((shot, outs))
+    return cells, rest
 
 
 def insert(doc: Path, snippet: str) -> bool:
@@ -336,7 +477,8 @@ def insert(doc: Path, snippet: str) -> bool:
     return True
 
 
-def update_doc(m: Manifest, doc: Path, only=None, base_url: str | None = None) -> list[str]:
+def update_doc(m: Manifest, doc: Path, only=None, base_url: str | None = None,
+               layout: Layout | None = None) -> list[str]:
     """Fill every marker in ``doc``: the whole-gallery block (``darkroom:start``/``end``) and each
     per-shot block (``<!-- darkroom:shot NAME -->...<!-- darkroom:end -->``, or the self-closing
     ``<!-- darkroom:shot NAME /-->``, which is expanded into the open/close form). Returns what
@@ -360,7 +502,9 @@ def update_doc(m: Manifest, doc: Path, only=None, base_url: str | None = None) -
         outs = _outputs(m, state, shot)
         if not outs:
             return original  # nothing shot yet: leave the block as it is
-        body = "\n".join(shot_markdown(m, shot, outs, link)).rstrip()
+        cells = shot_cells(m, state, shot, outs) if layout and layout.table else []
+        body = (table_html(m, cells, link, layout) if cells
+                else "\n".join(shot_markdown(m, shot, outs, link)).rstrip())
         done.append(name)
         return f"<!-- darkroom:shot {name} -->\n{body}\n<!-- darkroom:end -->"
 
@@ -373,7 +517,7 @@ def update_doc(m: Manifest, doc: Path, only=None, base_url: str | None = None) -
             if gallery_done:
                 pieces.append(text[a:b])
             else:
-                snippet = markdown(m, doc, only, base_url=base_url)
+                snippet = markdown(m, doc, only, base_url=base_url, layout=layout)
                 pieces.append(f"{START}\n{snippet}{END}")
                 done.append("gallery")
                 gallery_done = True

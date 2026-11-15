@@ -58,6 +58,8 @@ def lock(name: str | None, timeout: float | None = None, on_wait=None):
                 if not warned and on_wait:
                     on_wait(path)
                     warned = True
+                from .procs import check_stopping
+                check_stopping()  # shoot --jobs: a stopping run gives up waiting
                 if timeout is not None and time.monotonic() - start > timeout:
                     raise LockTimeout(f"lock '{name}' still busy after {timeout:g}s ({path})")
                 time.sleep(0.25)
