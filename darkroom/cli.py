@@ -9,6 +9,7 @@ from pathlib import Path
 from . import __version__
 from . import encode as enc
 from . import gallery
+from . import procs
 from .manifest import ManifestError, lint, load
 from .shoot import base_name, load_frames, make_pair, sheet_labels, shoot
 
@@ -50,8 +51,18 @@ def cmd_shoot(args):
     m = _load(args)
     if args.out:
         m.out_override = Path(args.out).resolve()
-    failed = shoot(m, only=args.only, tag=args.tag, retries=args.retries, force=args.force,
-                   encode_only=args.encode)
+    with procs.run_scope(args.manifest) as run:
+        others = [r["id"] for r in procs.find(manifest=args.manifest) if r["id"] != run.id and r["alive"]]
+        if others:
+            print(f"warning: another darkroom run is shooting {args.manifest} ({', '.join(others)}); "
+                  "takes of the same shot will collide", file=sys.stderr)
+        try:
+            failed = shoot(m, only=args.only, tag=args.tag, retries=args.retries, force=args.force,
+                           encode_only=args.encode)
+        except (KeyboardInterrupt, procs.Stopped) as e:
+            why = "interrupted" if isinstance(e, KeyboardInterrupt) else f"stopped ({e})"
+            print(f"darkroom run {run.id} {why}; its processes were stopped", file=sys.stderr)
+            return 130 if isinstance(e, KeyboardInterrupt) else 143
     if failed:
         print(f"{failed} shot(s) failed", file=sys.stderr)
     return 1 if failed else 0
@@ -92,6 +103,51 @@ def cmd_pair(args):
         shot = Shot({"name": f"{shot.name}-pair", "kind": "pair", "of": shot.name,
                      "labels": args.labels or ["before", "after"]}, -1)
     make_pair(m, shot)
+    return 0
+
+
+def _age(started: str | None) -> str:
+    import datetime as dt
+    try:
+        secs = int((dt.datetime.now() - dt.datetime.fromisoformat(started)).total_seconds())
+    except (TypeError, ValueError):
+        return "?"
+    return f"{secs // 3600}h{secs % 3600 // 60:02d}m" if secs >= 3600 else f"{secs // 60}m{secs % 60:02d}s"
+
+
+def cmd_ps(args):
+    rs = procs.runs()
+    if args.json:
+        print(json.dumps(rs, indent=2))
+        return 0
+    if not rs:
+        print("no darkroom runs")
+        return 0
+    print(f"{'RUN':<8} {'PID':>7} {'AGE':>7}  {'SHOT':<24} MANIFEST")
+    for r in rs:
+        status = "" if r["alive"] else f"  [darkroom gone; {len(r['live_groups'])} group(s) left: darkroom stop {r['id']}]"
+        print(f"{r['id']:<8} {r['pid']:>7} {_age(r.get('started')):>7}  {str(r.get('shot') or '-'):<24} "
+              f"{r.get('manifest') or '-'}{status}")
+    return 0
+
+
+def cmd_stop(args):
+    if bool(args.run_id) == bool(args.manifest):
+        print("stop: name one run: darkroom stop RUN-ID, or darkroom stop --manifest PATH "
+              "(darkroom ps lists them)", file=sys.stderr)
+        return 2
+    rs = procs.find(args.run_id, args.manifest)
+    if not rs:
+        print(f"stop: no live darkroom run {'for ' + args.manifest if args.manifest else repr(args.run_id)} "
+              "(darkroom ps lists them)", file=sys.stderr)
+        return 1
+    if len(rs) > 1 and not args.all:
+        print(f"stop: {len(rs)} runs match: {', '.join(r['id'] for r in rs)}; name one by its id, "
+              "or pass --all", file=sys.stderr)
+        return 2
+    for r in rs:
+        done = procs.stop(r, timeout=args.timeout)
+        print(f"stopped {r['id']}: " + ("; ".join(done) if done else "nothing was left running"))
     return 0
 
 
@@ -177,6 +233,17 @@ def main(argv=None):
     p.add_argument("--out", metavar="DIR", help="write every output (including 'file' ones) into DIR "
                    "instead, e.g. a scratch dir for review; the takes are shared")
     p.set_defaults(fn=cmd_shoot)
+
+    p = sub.add_parser("ps", help="list this user's running darkroom shoots (stale entries are pruned)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_ps)
+
+    p = sub.add_parser("stop", help="stop one darkroom run and every process it started (never pkill -f)")
+    p.add_argument("run_id", nargs="?", metavar="RUN-ID", help="as darkroom ps shows it (a unique prefix will do)")
+    p.add_argument("--manifest", metavar="PATH", help="the run shooting this manifest")
+    p.add_argument("--all", action="store_true", help="with --manifest: stop every run of it")
+    p.add_argument("--timeout", type=float, default=15, help="seconds to let it clean up before killing (15)")
+    p.set_defaults(fn=cmd_stop)
 
     p = sub.add_parser("gallery", help="markdown (or HTML) for the outputs")
     common(p)

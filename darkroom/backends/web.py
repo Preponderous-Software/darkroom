@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from .. import procs
 from ..manifest import template
 from .command import CaptureError
 
@@ -74,8 +75,11 @@ def playwright_available(project_dir: Path | str = ".") -> bool:
     node = shutil.which("node")
     if not node:
         return False
-    p = subprocess.run([node, "-e", "require('playwright')"], env=node_env(Path(project_dir)),
-                       cwd=str(project_dir), capture_output=True)
+    try:
+        p = procs.run([node, "-e", "require('playwright')"], env=node_env(Path(project_dir)),
+                      cwd=str(project_dir), timeout=60)
+    except subprocess.TimeoutExpired:
+        return False
     return p.returncode == 0
 
 
@@ -141,8 +145,10 @@ def _capture_once(shot, device: dict, variables: dict, frames_dir: Path, log=pri
             "cwd": str(project),
         }
         try:
-            p = subprocess.run([node, str(RUNNER)], input=json.dumps(job), text=True, capture_output=True,
-                               env=node_env(project), cwd=str(project), timeout=timeout)
+            # The runner (and the Chromium it launches) in its own process group: on a timeout,
+            # a stop or Ctrl-C the whole browser tree is killed, not just Node.
+            p = procs.run([node, str(RUNNER)], input=json.dumps(job), text=True,
+                          env=node_env(project), cwd=str(project), timeout=timeout)
         except subprocess.TimeoutExpired:
             raise CaptureError(f"browser run timed out after {timeout:g}s")
         try:

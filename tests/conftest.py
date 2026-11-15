@@ -26,3 +26,11 @@ def lock_dir(tmp_path, monkeypatch):
     d = tmp_path / "locks"
     monkeypatch.setenv("DARKROOM_LOCK_DIR", str(d))
     return d
+
+
+@pytest.fixture(autouse=True)
+def run_dir(tmp_path, monkeypatch):
+    """Keep every test's run registry out of the real one (other runs may be live)."""
+    d = tmp_path / "runs"
+    monkeypatch.setenv("DARKROOM_RUN_DIR", str(d))
+    return d
