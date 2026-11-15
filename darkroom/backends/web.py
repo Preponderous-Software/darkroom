@@ -43,6 +43,24 @@ def template_steps(steps, variables: dict):
     return out
 
 
+def init_scripts(init, variables: dict, project: Path) -> list[str]:
+    """``initScript`` as a list of JS sources, in order: strings are templated with vars (like
+    ``url``); ``{"file": path}`` entries are read from the path (templated, relative to the
+    manifest) as they are."""
+    items = init if isinstance(init, list) else [init] if init is not None else []
+    out = []
+    for it in items:
+        if isinstance(it, dict):
+            path = project / str(template(it["file"], variables))
+            try:
+                out.append(path.read_text())
+            except OSError as e:
+                raise CaptureError(f"initScript: cannot read '{it['file']}': {e.strerror or e}")
+        else:
+            out.append(str(template(it, variables)))
+    return out
+
+
 def node_env(project_dir: Path) -> dict:
     env = dict(os.environ)
     paths = [str(project_dir / "node_modules")]
@@ -116,6 +134,8 @@ def _capture_once(shot, device: dict, variables: dict, frames_dir: Path, log=pri
             "block": shot.get("block", []),
             "vars": {k: v for k, v in variables.items() if k != "manifest_dir"},
             "launchArgs": shot.get("launchArgs", LAUNCH_ARGS),
+            "initScripts": init_scripts(shot.get("initScript"), variables, project),
+            "context": template(shot.get("context") or {}, variables),
             "framesDir": str(frames_dir),
             "resultPath": str(Path(tmp) / "result.json"),
             "cwd": str(project),

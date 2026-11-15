@@ -100,3 +100,25 @@ def test_steps_added_in_0_3(server, write_manifest):
     assert not (p.parent / "media/tour.jpg").exists()
     meta = json.loads((p.parent / ".darkroom/takes/tour/meta.json").read_text())
     assert meta["names"] == ["tour-first", "tour-second"]
+
+
+@pytest.mark.skipif(not playwright_available(), reason="Node Playwright not resolvable (set NODE_PATH)")
+def test_init_script_and_context(server, write_manifest):
+    """initScript runs before the page's own scripts (a string templated with vars, then a file);
+    context options reach browser.newContext."""
+    (write_manifest({}, "unused.json").parent / "init.js").write_text(
+        "window.order = (window.order || []).concat('file');")
+    p = write_manifest({"vars": {"base": server, "q": "high"}, "shots": [{
+        "name": "seeded", "kind": "still", "url": "{base}index.html", "retries": 0,
+        "device": {"width": 160, "height": 90},
+        "initScript": ["window.pre = typeof window.__strataKit; localStorage.setItem('q', '{q}');"
+                       " window.order = ['inline'];", {"file": "init.js"}],
+        "context": {"reducedMotion": "reduce", "locale": "de-DE", "colorScheme": "dark"},
+        "steps": [{"waitFor": "window.pre === 'undefined' && localStorage.getItem('q') === 'high'"
+                              " && window.order.join() === 'inline,file'"
+                              " && matchMedia('(prefers-reduced-motion: reduce)').matches"
+                              " && matchMedia('(prefers-color-scheme: dark)').matches"
+                              " && navigator.language === 'de-DE'", "timeout": 5000}]}]})
+    logs = []
+    assert shoot(load(p), log=logs.append) == 0, logs
+    assert (p.parent / "media/seeded.jpg").exists()

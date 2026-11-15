@@ -58,10 +58,13 @@ async function waitTrue(page, code, scope, timeout, what) {
     // A fresh context per take (nothing persists between takes); "monitor" in the user
     // agent so sites that count visits can skip this one.
     const context = await browser.newContext({
+      ...(job.context || {}),
       viewport: { width: dev.width, height: dev.height },
       deviceScaleFactor: dev.dpr || 1, hasTouch: !!dev.touch, isMobile: !!dev.mobile,
       userAgent: job.userAgent || baseUA.replace("HeadlessChrome", "Chrome") + " darkroom-monitor",
     });
+    // initScript: runs in every page (and frame) before the page's own scripts, in order.
+    for (const content of job.initScripts || []) await context.addInitScript({ content });
     context.setDefaultTimeout(T);
     context.setDefaultNavigationTimeout(Math.max(T, job.readyTimeout || 0));
     for (const pattern of job.block || []) await context.route(pattern, (r) => r.abort());

@@ -193,7 +193,22 @@ def encode_take(m: Manifest, shot: Shot, tag: str | None, log=say) -> list[str]:
     if shot.kind == "still":
         fmt, ext = still_format(shot)
         names = meta.get("names") or []
-        if any(names):
+        named = shot.named_outputs()
+        if named and shot.backend == "command":
+            # A command still's named outputs: <name>-<key>.<ext>, or the `file` template with {key}.
+            templated = "{key}" in (shot.get("file") or "")
+            by_key = dict(zip(names, frames))
+            for okey, _ in named:
+                if okey not in by_key:
+                    raise CaptureError(f"{key}: the saved take has no output '{okey}'; reshoot it")
+                if templated:
+                    b = output_base(m, shot, tag, {"key": okey})
+                    path = b.parent / (b.name + ext)
+                else:
+                    path = at(f"-{okey}{ext}")
+                results.append(enc.encode_still(by_key[okey], path, budgets["still_kb"], fmt,
+                                                shot.get("quality", 86), shot.get("width"), colors))
+        elif any(names):
             # Named captures: one still per name, beside the shot's other outputs.
             suffix = f".{tag}" if tag else ""
             for k, name in enumerate(names):
@@ -347,21 +362,110 @@ def make_grid(m: Manifest, shot: Shot, log=say) -> list[str]:
     return [_rel(m, r.path)]
 
 
+def plan(m: Manifest, only=None) -> list[Shot]:
+    """The shots to run, in order. With ``only``, the preps the named shots depend on (directly
+    or through other preps) are added; they still skip themselves when up to date. Shots run in
+    manifest order, pairs and grids last (they read other shots' takes), except that every shot
+    runs after the shots it ``depends`` on."""
+    all_shots = {s.name: s for s in m.shots if not s.get("skip")}
+    chosen = [s for s in all_shots.values() if not only or s.name in only]
+    if only:
+        names = {s.name for s in chosen}
+        stack = list(chosen)
+        while stack:
+            for dep in stack.pop().get("depends") or []:
+                d = all_shots.get(dep)
+                if d is not None and d.prep and d.name not in names:
+                    names.add(d.name)
+                    chosen.append(d)
+                    stack.append(d)
+    order = sorted(chosen, key=lambda s: (s.composite, s.index))
+    names = {s.name for s in order}
+    out: list[Shot] = []
+    placed: set[str] = set()
+    while order:
+        # The first shot (in the usual order) whose dependencies (in this run) have all run.
+        for k, s in enumerate(order):
+            if all(d in placed or d not in names for d in s.get("depends") or []):
+                break
+        else:  # a cycle; validation rejects these, so keep the usual order
+            k = 0
+        s = order.pop(k)
+        out.append(s)
+        placed.add(s.name)
+    return out
+
+
+def run_prep(m: Manifest, shot: Shot, state: State, retries: int, force: bool, log=say) -> None:
+    """Run a prep unless it is up to date: same capture hash (argv, env, inputs, vars...) and
+    every declared output still exists."""
+    key = shot.name
+    cap_h = m.capture_hash(shot, None)
+    outputs = [str(o) for o in template(shot["outputs"], m.vars)]
+    prev = state.get(key) or {}
+    if not force and prev.get("capture_hash") == cap_h and all((m.dir / o).exists() for o in outputs):
+        log(f"= {key}: up to date (use --force to rerun)")
+        return
+    log(f"> {key} (prep)")
+    device = m.device(shot.get("device", "desktop"))
+    attempts = 1 + retries
+    last: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            t0 = time.monotonic()
+            with lock(shot.get("lock"), on_wait=lambda p: log(f"  {key}: waiting for lock {p}")):
+                command_backend.run_prep(shot, device, dict(m.vars, tag=""), log=log)
+            absent = [o for o in outputs if not (m.dir / o).exists()]
+            if absent:
+                raise CaptureError(f"the prep did not write {', '.join(absent)} (its declared outputs)")
+            for o in outputs:
+                log(f"  {o}")
+            state.put(key, {"capture_hash": cap_h, "outputs": outputs, "kind": "prep", "darkroom": __version__,
+                            "seconds": round(time.monotonic() - t0, 1),
+                            "when": _dt.datetime.now().isoformat(timespec="seconds")})
+            return
+        except (CaptureError, OSError, ValueError) as e:
+            last = e
+            msg = [l for l in _ANSI.sub("", str(e)).strip().splitlines() if l.strip()]
+            log(f"  {key}: attempt {attempt}/{attempts} failed: {msg[0] if msg else e}")
+            for extra in msg[1:4]:
+                log(f"      {extra}")
+    raise CaptureError(f"{key}: all {attempts} attempt(s) failed: {last}")
+
+
 def shoot(m: Manifest, only=None, tag=None, retries=None, force=False, encode_only=False, log=say) -> int:
     """Shoot (or with encode_only, re-encode the last takes of) the selected shots.
     Returns the number of failed shots."""
     state = State(m)
-    shots = [s for s in m.shots if (not only or s.name in only) and not s.get("skip")]
     if only:
-        missing = set(only) - {s.name for s in shots}
+        present = {s.name for s in m.shots if not s.get("skip")}
+        missing = set(only) - present
         for name in sorted(missing):
             log(f"no shot named '{name}'")
         if missing:
             return len(missing)
     failed = 0
-    # Pairs and grids last: they read other shots' takes.
-    for shot in sorted(shots, key=lambda s: s.composite):
+    broken: set[str] = set()  # shots that failed (or were skipped for it) in this run
+    for shot in plan(m, only):
         if shot.composite and tag:
+            continue
+        bad = [d for d in shot.get("depends") or [] if d in broken]
+        if bad:
+            failed += 1
+            broken.add(shot.name)
+            log(f"! {base_name(shot, None if shot.prep else tag)}: skipped: depends on "
+                + ", ".join(f"'{d}'" for d in bad) + ", which failed")
+            continue
+        if shot.prep:
+            if encode_only:
+                continue  # a prep makes no images, so there is nothing to re-encode
+            try:
+                run_prep(m, shot, state, shot.get("retries", 2) if retries is None else retries,
+                         force and (not only or shot.name in only), log)
+            except Exception as e:
+                failed += 1
+                broken.add(shot.name)
+                log(f"! {shot.name}: FAILED: {str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__}")
             continue
         key = base_name(shot, tag)
         # A review shoot (--out) keeps its own record, so the real outputs' entry is untouched.
@@ -402,5 +506,6 @@ def shoot(m: Manifest, only=None, tag=None, retries=None, force=False, encode_on
                              "when": _dt.datetime.now().isoformat(timespec="seconds")})
         except Exception as e:  # one failing shot doesn't stop the others
             failed += 1
+            broken.add(shot.name)
             log(f"! {key}: FAILED: {str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__}")
     return failed
