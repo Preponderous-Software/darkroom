@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+0.6 manifests keep working, and the capture and encode hashes of unchanged shots are the same,
+so nothing is reshot on upgrade. The new fields (`clock`, a measured `crop`) are capture fields.
+
+### Added
+
+- **Mouse steps**: `{"mouse": "down" | "up" | "move", "at": position, "button": "left" | "right" |
+  "middle"}`, with `"by": [dx, dy]` for a move relative to the pointer's last position (so a move
+  in a `repeat` walks the pointer along) and `"steps"` for intermediate moves;
+  `{"drag": {"from", "to", "steps", "button"}}`; and `{"wheel": {"dx", "dy"}, "at": position}`.
+  Positions take every form `tap` does. All go through Playwright's mouse, for 3D views that
+  orbit or look around by dragging.
+- **A paced clock** for real-time pages: `"clock": {"mode": "paced", "step": 0.05}`. The page's
+  `setTimeout`, `setInterval`, `requestAnimationFrame`, `performance.now`, `Date.now` and
+  `new Date()` advance only when a `frames` step steps them (due timers in order, then one round
+  of animation frames), so a clip is the page at exact intervals of its own time and the same on
+  any machine. `start` is `ready` (paced once the page is ready; the default) or `load` (from the
+  first script). `engine` is `darkroom` (its own init script, one round of animation frames per
+  step; the default) or `playwright` (Playwright's `page.clock`, which runs animation frames on a
+  16 ms grid). The README lists what is and is not paced.
+- **Measured crops**: `"crop": {"of": "css", "pad": 8}` crops to an element's box plus `pad`,
+  measured at the shot's first capture (clamped to the viewport) and kept for the rest of it. The
+  rectangle used is recorded in the take's `meta.json` (`crop`, or `crops` per run with `each`).
+
+### Changed
+
+- `frames` takes a `step` on a paced shot as well as on `strata-kit`.
+- A paced shot's `ready` is polled from Node, and `stable` polls on the wall clock, since the
+  page's own timers and animation frames may be standing still.
+
 ## 0.6.0 (2026-11-15)
 
 0.5 manifests keep working, and the capture and encode hashes of unchanged shots are the same,
