@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 (2026-11-15)
 
 0.6 manifests keep working, and the capture and encode hashes of unchanged shots are the same,
 so nothing is reshot on upgrade. The new fields (`clock`, a measured `crop`) are capture fields.
