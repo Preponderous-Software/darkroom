@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "darkroom"
-version = "0.1.0"
+version = "0.2.0"
 description = "A small media-capture kit: stills, GIFs, MP4s, contact sheets, before/after pairs and doc galleries from a JSON shot list."
 readme = "README.md"
 license = { text = "MIT" }

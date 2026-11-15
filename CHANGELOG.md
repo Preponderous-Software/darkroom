@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (2026-11-15)
 
 From the first pilot: a native desktop game captured through the `command` backend under Xvfb.
 
@@ -51,7 +51,7 @@ From the first pilot: a native desktop game captured through the `command` backe
   whole-gallery block.
 - `{work_dir}` for `command` shots.
 
-## 0.1.0 (unreleased)
+## 0.1.0 (2026-11-15)
 
 First version.
 
