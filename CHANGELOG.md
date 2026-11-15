@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased (0.6)
+
+0.5 manifests keep working, and the capture and encode hashes of unchanged shots are the same,
+so nothing is reshot on upgrade.
+
+### Added
+
+- **The whole console per take** (#14): every console message (type, text, location, time;
+  uncaught exceptions as `pageerror`) is kept in the take's `console.jsonl`, `meta.json` counts
+  them by type, and warnings are reported after a shot. `consoleErrors` is unchanged.
+  **`failOnConsole: ["error", "warning"]`** fails an attempt on any of those types;
+  `failOnConsoleError` is kept as an alias for `["error"]`.
+- **Per-shot `vars`** (#15), merged over the manifest's (`--var` still wins).
+- **`device` with vars** (#15): `"device": "{dev}"`, or `"{value}"` with `each` so each run has
+  its own device (and, for `command` shots, its own `{width}`/`{height}` and Xvfb size).
+- **`each` with named captures** (#15): capture names are templated (`"menu-{value}"`), so one
+  shot can make several screens on several devices. `darkroom check` asks for `{value}` in the
+  names. `examples/static-page/devices.json` is a worked example.
+- **Web steps** (#16): `{"stable": "css", "timeout": ms}` waits until an element's box stops
+  changing; `tap` and `click` take `{"at": [fx, fy], "of": "css"}` (fractions of the element's
+  box); `"force": true` on `tap` and `click` skips the actionability checks.
+- **Page sessions** (#17): consecutive web shots with the same `session` share one browser page:
+  it opens and `setup` runs once, then each shot's steps run in turn. A failed shot or a retry
+  discards the session and starts a fresh page; state, hashes and takes stay per shot; the
+  session holds the shot's `lock` while it is open.
+- **A per-device table in the gallery** (#18): `darkroom gallery --layout table --by device`, or
+  `"gallery": {"layout": "table", "by": "device", "widths": {...}}` in the manifest, makes a row
+  per screen (named capture, `each` value, or plain still; `gallery.row` names one) and a column
+  per device, with image widths set per column, in markdown (an HTML table) and the HTML page.
+- **`darkroom shoot --jobs N`**: runs independent shots at once within one run. Shots with the
+  same `lock` never overlap, dependents wait for the shots they depend on, a session's shots
+  run in order, and pairs and grids run last. Each line of output starts with its shot's name;
+  the run registry lists every current shot (`shots`; `shot` joins them for `darkroom ps`). The
+  default stays 1.
+
+- **`darkroom shoot --adopt`**: shoots nothing, and records each shot whose outputs all exist
+  as up to date for its current hashes, so a fresh checkout or worktree (no `.darkroom` state)
+  does not reshoot committed outputs. The README explains why a fresh checkout reshoots.
+
+### Fixed
+
+- `darkroom sheet FOLDER` on a folder that does not exist printed a traceback; it now says so
+  and names the take folders of that name it finds nearby (takes live beside their manifest).
+
+### Changed
+
+- `each` and named captures no longer conflict (the 0.5 validation error is gone).
+- The run registry entry has a `shots` list; `shot` is now the current shots joined by `, `.
+
 ## 0.5.0 (2026-11-15)
 
 Manifests, outputs and capture hashes are unchanged: nothing is reshot on upgrade.

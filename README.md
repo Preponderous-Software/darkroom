@@ -77,6 +77,7 @@ darkroom check media.json                       # validate, with the exact place
 darkroom shoot media.json                       # shoot everything that isn't up to date
 darkroom shoot media.json --only walk --force   # reshoot one
 darkroom shoot media.json --out /tmp/review     # every output into a scratch dir, for review
+darkroom shoot media.json --jobs 3              # up to three independent shots at once
 darkroom gallery media.json --relative-to README.md   # print markdown for the outputs
 darkroom gallery media.json --insert README.md        # update the images in a doc in place
 ```
@@ -145,8 +146,9 @@ Top level:
 | Key | Meaning |
 |---|---|
 | `out` | Output directory, relative to the manifest (default `media`). |
-| `vars` | Values for `{name}` placeholders in `url`, `ready`, `argv`, `env`, `cwd` and `file`. Vars may use other vars. `--var name=value` overrides. A var can be a list, spliced into `argv` as a whole `"@name"` entry (see [Shared flags](#shared-flags-list-vars-and-key)). Built in: `{manifest_dir}`; with `each`, `{value}`, `{i}`, `{n}`; and for `command` shots `{out_dir}`, `{work_dir}`, `{width}`, `{height}`, `{dpr}`, `{display}`, `{name}`, `{tag}`. Unknown placeholders are left alone, so JS and JSON braces are safe. |
+| `vars` | Values for `{name}` placeholders in `url`, `ready`, `argv`, `env`, `cwd` and `file`. Vars may use other vars. `--var name=value` overrides. A var can be a list, spliced into `argv` as a whole `"@name"` entry (see [Shared flags](#shared-flags-list-vars-and-key)). Built in: `{manifest_dir}`; with `each`, `{value}`, `{i}`, `{n}`; and for `command` shots `{out_dir}`, `{work_dir}`, `{width}`, `{height}`, `{dpr}`, `{display}`, `{name}`, `{tag}`. Unknown placeholders are left alone, so JS and JSON braces are safe. A shot can add or override vars in its own `vars`. |
 | `devices` | Extra devices: `{ "name": { "width", "height", "dpr", "touch", "mobile" } }`. |
+| `gallery` | How `darkroom gallery` lays the shots out by default: `{ "layout": "table", "by": "device", "widths": { "phone": 200 } }` (see [Gallery](#gallery)). `layout` is `list` (the default) or `table`. |
 | `budgets` | `still_kb` (200), `gif_mb` (3), `mp4_kb` (600), `webm_kb` (400). A shot can override any of them in its own `budgets`. |
 | `defaults` | Fields every shot starts from. Objects merge one level deep, lists are replaced unless the shot writes `KEY+` to extend them (`argv+`, `steps+`, `setup+`, `block+`, `launchArgs+`), and fields for the other backend are ignored. |
 | `shots` | The list of shots. |
@@ -158,12 +160,13 @@ Every shot:
 | `name` | Unique; becomes the file name (`name.jpg`, `name.gif`, ...). |
 | `kind` | `still` (one image, or one per named `capture` or command `outputs` entry), `clip` (frames from `capture` steps), `pair` (before/after), `grid` (a captioned composite of other shots) or `prep` (a command that writes files, not images; see [Prep shots, inputs and depends](#prep-shots-inputs-and-depends)). |
 | `backend` | `web` (default) or `command`. |
-| `device` | `desktop` (1280x720), `hd` (1920x1080), `phone` (390x844, DPR 3, touch, mobile), `landscape-phone` (844x390), a custom name, or an inline `{ "width", "height", ... }`. |
+| `device` | `desktop` (1280x720), `hd` (1920x1080), `phone` (390x844, DPR 3, touch, mobile), `landscape-phone` (844x390), a custom name, or an inline `{ "width", "height", ... }`. A name can use vars: `"{dev}"` (a shot var), or `"{value}"` with `each`, so each run has its own device (see [Screens × devices](#screens--devices)). |
+| `vars` | This shot's own vars, merged over the manifest's (`--var` still wins). They fill in everywhere the manifest's do, and a change reshoots only this shot. |
 | `caption`, `alt` | Used by the gallery. Say so in `alt` if `speed` > 1. |
 | `format`, `quality`, `width` | Stills: `jpg` (default) or `png`, starting JPEG quality (86), maximum width. |
 | `colors` | PNG stills, pairs and grids: quantize to at most this many colours (2 to 256). Budget fitting can still go lower. |
 | `file` | Write the output to this path (relative to the manifest) instead of `<out>/<name>.<ext>`, so a shot can replace an existing image in place. The extension picks the format: `.jpg`/`.png` for stills, pairs and grids; `.gif`, `.mp4` or `.webm` for a clip (its other outputs share the name: `walk.gif`, `walk.mp4`, `walk-poster.jpg`). A tag goes before the extension (`seasons.before.png`). Vars, `{name}`, and with `each` `{value}`/`{i}`, are filled in. |
-| `each` | `web` and `command`: a list of values, one run each (a fresh browser or process), with `{value}`, `{i}` and `{n}` set (also in the page's `vars`). Implies `repeat` = its length. A still makes one image per value (`name-<value>.jpg`, or the `file` template); a clip plays the runs in order. |
+| `each` | `web` and `command`: a list of values, one run each (a fresh browser or process), with `{value}`, `{i}` and `{n}` set (also in the page's `vars`). Implies `repeat` = its length. A still makes one image per value (`name-<value>.jpg`, or the `file` template); a clip plays the runs in order. A web still can name its captures instead, with `{value}` in each name (`{"capture": "menu-{value}"}`), for several screens per value. |
 | `aspect` | Centre-crop every frame to a ratio such as `"16:9"` or `"1:1"`. |
 | `fps`, `speed` | Clip playback rate (12) and a speed-up factor. |
 | `every` | Clips: keep every Nth captured frame (2 halves a long take). `gif.every` and `video.every` override it for one output. Playback `fps` is unchanged, so the clip gets shorter. |
@@ -172,7 +175,7 @@ Every shot:
 | `poster` | Frame for a poster JPEG: an index, or a fraction of the clip (default 0.6 when there is video). |
 | `sheet` | `true` also publishes the contact sheet as `<name>-sheet.png` (one is always kept with the take for review); or `{ "labels": "none" \| "index" \| "caption", "cols": 4, "width": 1600 }`. `index` (default) labels tiles `#3`; `caption` uses each frame's `each` value. |
 | `retries`, `timeout`, `lock`, `lockTimeout` | Attempts after the first (2), seconds per attempt, a lock name, and how many seconds to wait for that lock before the attempt fails (default: wait as long as it takes). |
-| `gallery` | How the gallery shows the shot: `{ "width": 480 }` writes `<img ... width="480">`; `"poster": true` shows a clip's poster beside its GIF (and makes the poster). Changing it never reshoots. |
+| `gallery` | How the gallery shows the shot: `{ "width": 480 }` writes `<img ... width="480">`; `"poster": true` shows a clip's poster beside its GIF (and makes the poster); `"row": "title"` names a plain still's row in the [table layout](#gallery). Changing it never reshoots. |
 | `skip` | Leave the shot out of `shoot`. |
 | `inputs` | Paths or globs (relative to the manifest, templated) whose file contents feed the capture hash: a changed, added or removed file reshoots the shot. A directory stands for every file under it. |
 | `depends` | Shot names that run first. A `prep` named here also runs under `--only` (unless it is up to date), and its `outputs` count as this shot's `inputs`. |
@@ -190,7 +193,9 @@ Every shot:
 | `css` | Styles injected once the page is ready (hide the HUD). |
 | `setup`, `steps` | Step lists, run in that order. A still is the page after the steps; a clip is every `capture`. |
 | `crop` | `[x, y, width, height]` in CSS pixels: capture only that part of the page. |
-| `failOnConsoleError` | Fail the attempt if the page logs an error (errors are always reported). |
+| `failOnConsole` | Console message types that fail the attempt: `["error", "warning"]` (also `info`, `log`, `debug`, ...; `error` includes uncaught exceptions). Every message is kept in the take's `console.jsonl` either way (see [Takes](#takes-resume-and-re-encoding)). |
+| `failOnConsoleError` | The same as `"failOnConsole": ["error"]` (kept from 0.1). Errors are always reported. |
+| `session` | A name: consecutive web shots with the same session share one browser page, so a heavy page loads once (see [Sessions](#sessions-one-page-for-several-shots)). |
 | `userAgent`, `block` | darkroom appends `darkroom-monitor` to Chromium's user agent, so sites that count visits can skip captures. `block` is a list of URL patterns to abort (analytics, scores). |
 | `launchArgs` | Chromium flags. The default renders WebGL with SwiftShader, so it works headless and in CI. |
 | `initScript` | JS that runs in every page before the page's own scripts (Playwright's `addInitScript`): seed `localStorage` or a save file, or wrap `requestAnimationFrame` with a clock you can freeze. A string (vars filled in, like `url`), `{ "file": "tools/capture-init.js" }` (relative to the manifest; the path is templated, the file is sent as it is), or a list of those, run in order. A file's contents feed the capture hash. |
@@ -204,7 +209,10 @@ Steps (one verb per object):
 | `{"key": "KeyW", "action": "down"}` | `down`, `up` or `press` (default). |
 | `{"type": "hello"}` | Types text. |
 | `{"tap": [x, y]}` / `{"tap": "css selector"}` | A touch tap (on touch devices; a click otherwise), at a point or at the centre of the first matching element. |
+| `{"tap": {"at": [0.5, 0.8], "of": "canvas"}}` | A tap at fractions of an element's box (`[0, 0]` is its top left, `[1, 1]` its bottom right), so taps on a canvas follow the layout from one device to the next. `click` takes the same form. |
 | `{"click": "css selector"}` | Clicks an element. |
+| `"force": true` | On `tap` and `click`: skip Playwright's actionability checks (visible, stable, receives events), for an element that never stops animating. |
+| `{"stable": "css selector", "timeout": 30000}` | Waits until the element's box is the same over a few animation frames (it has stopped moving or resizing). Fails the attempt after `timeout` ms. |
 | `{"wait": 250}` | Waits, in wall-clock milliseconds. |
 | `{"waitFor": "js expr", "timeout": 30000}` | Waits until the expression is truthy: game state, not guesswork. Fails the attempt if it never is. |
 | `{"frames": 6}` / `{"frames": 3, "step": 0.1}` | `strata-kit`: drives 6 frames of game time (`step` seconds each; default `frameStep`). `hook`: waits 6 animation frames. |
@@ -216,6 +224,66 @@ Steps (one verb per object):
 | `{"until": "js expr", "steps": [...], "max": 40, "then": 2}` | Runs the steps, then checks the expression, until it is truthy or `max` passes have run (a warning, not a failure), then `then` more passes. Inside: `i`, `n` (= `max`), `u`. |
 | `{"mark": "in"}` / `{"mark": "out"}` | Trims the clip to the frames between the marks. |
 | `{"repeat": 36, "var": "i", "steps": [...]}` | Runs the inner steps `n` times. |
+
+### Sessions: one page for several shots
+
+Every shot opens a fresh browser by default, which is what makes retries safe, but a page that
+takes minutes to boot (a WebAssembly game, say) then boots once per shot. Give consecutive web
+shots the same `session` and they share one page:
+
+```json
+{
+  "defaults": { "url": "{base}", "device": "phone", "session": "game",
+                "setup": [ { "waitFor": "window.game && game.loaded", "timeout": 900000 } ] },
+  "shots": [
+    { "name": "title" },
+    { "name": "map", "steps": [ { "js": "game.open('map')" }, { "waitFor": "game.screen === 'map'" } ] },
+    { "name": "shop", "steps": [ { "js": "game.open('shop')" }, { "waitFor": "game.screen === 'shop'" } ] }
+  ]
+}
+```
+
+The page is opened (`url`, `ready`, `css`) and `setup` runs once, then each shot's `steps` run
+in turn on that page, and each shot is captured as usual. Move between screens with `js` and
+`waitFor` steps rather than `goto` (which loads the page again).
+
+- Every shot of a session must agree on what opens the page: `url`, `device`, `setup`, `ready`,
+  `css`, `adapter`, `initScript`, `context`, `block`, `launchArgs`, `userAgent`, `lock`, ...
+  (`darkroom check` names the first field that differs). Put them in `defaults`.
+- Only consecutive shots share a page (in run order: `depends` and `--only` can change it). A
+  shot of another session, or with none, in between closes it.
+- **A failed shot discards the session**, and its retry starts with a fresh page: `setup` runs
+  again, then that shot's steps, without the steps of the shots before it. The same holds for
+  shots skipped because they are up to date. Write each shot's steps so they reach its screen
+  from wherever `setup` leaves the page.
+- The state, hashes and takes stay per shot: adding a `session` reshoots nothing, and an up to
+  date shot is skipped without opening the page.
+- The `lock` is taken when the page opens and held until the session closes.
+- `each` cannot be combined with a session (it opens a fresh page per value).
+
+### Screens × devices
+
+To shoot the same screens on several devices without copying shots, loop over the devices
+with `each` and name a capture per screen, with `{value}` in the name.
+[`examples/static-page/devices.json`](examples/static-page/devices.json):
+
+```json
+{
+  "gallery": { "layout": "table", "by": "device" },
+  "shots": [
+    { "name": "screens", "each": ["phone", "tablet", "desktop"], "device": "{value}",
+      "url": "{page}", "steps": [
+        { "capture": "drying-{value}" },
+        { "stable": "#btn" }, { "tap": { "at": [0.5, 0.5], "of": "#btn" } },
+        { "capture": "developed-{value}" } ] }
+  ]
+}
+```
+
+That writes `drying-phone.jpg`, `developed-phone.jpg`, `drying-tablet.jpg`, ..., one browser per
+device, and `darkroom gallery` lays them out as rows (`drying`, `developed`) and columns
+(`phone`, `tablet`, `desktop`). The other way round works too: one shot per device with a shot
+var (`"vars": {"dev": "phone"}, "device": "{dev}"`) and `each` over the screens.
 
 ### The command backend
 
@@ -334,8 +402,17 @@ paths: `"before": "a.png", "after": "b.png"`.
 ## Takes, resume and re-encoding
 
 Each shot's raw frames are kept as a take in `.darkroom/takes/<name>/` next to the manifest,
-with a `meta.json` (device, frames, console errors, attempt, time, darkroom version, capture
-hash) and a contact sheet. Add `.darkroom/` to your `.gitignore`.
+with a `meta.json` (device, frames, console errors and a count of console messages by type,
+attempt, time, darkroom version, capture hash) and a contact sheet. A web take also keeps the
+page's whole console in `console.jsonl`, one message per line:
+
+```json
+{"type": "warning", "text": "WebGL: too many contexts", "location": {"url": "http://127.0.0.1:8000/game.js", "lineNumber": 41, "columnNumber": 9}, "time": "2026-11-15T14:02:11.204Z"}
+```
+
+`type` is Playwright's (`log`, `info`, `warning`, `error`, `debug`, ...) or `pageerror` for an
+uncaught exception; with `each`, each line also has its `run`. Add `.darkroom/` to your
+`.gitignore`.
 
 `darkroom shoot` keeps two hashes per shot:
 
@@ -347,9 +424,17 @@ hash) and a contact sheet. Add `.darkroom/` to your `.gitignore`.
   When only this changes, the saved take is re-encoded without reshooting.
 
 Neither includes the darkroom version, `retries`, `lock`, `timeout`, `screenshotTimeout`,
-`comment`, `caption`, `alt` or `gallery` width, so changing those (or upgrading) never marks a
-shot stale. State written by darkroom 0.1 or 0.2 is recognised and adopted on the first 0.3 run
+`comment`, `caption`, `alt`, `gallery` width, `failOnConsole` or `session`, so changing those (or
+upgrading) never marks a shot stale. A shot's own `vars` count like the manifest's. State written by darkroom 0.1 or 0.2 is recognised and adopted on the first 0.3 run
 when the shot has not changed.
+
+**A fresh checkout reshoots everything.** The state and takes live in `.darkroom/`, which is
+not committed, so a new clone or `git worktree` has none, and every shot looks new even when
+its outputs are committed. `darkroom shoot media.json --adopt` shoots nothing: it records each
+shot whose outputs all exist (worked out from the manifest) as up to date for its current
+capture and encode hashes, and names the shots it could not adopt. After that, a shot is
+reshot only when it changes. An adopted shot has no take, so `--encode`, `sheet`, and a pair
+or grid that reads it need one real shoot of it first.
 
 `--out DIR` writes every output into `DIR`, including shots with a `file`, and keeps its own
 record in the state, so a review shoot never touches the real outputs. The takes are shared,
@@ -361,6 +446,10 @@ darkroom sheet media.json walk                   # contact sheet of a take -> <o
 darkroom sheet .darkroom/takes/walk              # the same, from the take folder
 darkroom sheet path/to/folder -o review.png      # contact sheet of any folder of images
 ```
+
+Takes live beside their manifest (`tools/capture/.darkroom/takes/walk` for
+`tools/capture/media.json`), not at the repo root; when a take folder does not exist, `sheet`
+says where takes of that name are. `darkroom sheet MANIFEST SHOT` finds the take for you.
 
 Sheets are for reviewing takes. Tiles are sized from the frames so the sheet is about 1600 px
 wide (`--width`; `--thumb` fixes the tile width; small frames are not upscaled), up to 24
@@ -391,6 +480,19 @@ in any project, then take turns: use it for anything RAM-heavy or anything that 
 run twice at once. Locks are released when the process exits, even on a crash. While a lock
 is busy, darkroom says which pid holds it; `"lockTimeout": 600` makes an attempt fail after
 that many seconds of waiting instead of waiting for as long as it takes.
+
+### Parallel shots: `--jobs`
+
+`darkroom shoot media.json --jobs 3` runs up to three independent shots at once in one run
+(the default is 1, one after another). Shots with the same `lock` never overlap (and the lock
+still keeps other runs out), a shot starts only after the shots it `depends` on have finished
+(and is skipped if one failed), the shots of one [session](#sessions-one-page-for-several-shots)
+run one after another on their page, and pairs and grids run last. Each line of output starts
+with its shot's name (`[walk] > walk (clip, web)`), `darkroom ps` lists every shot under way,
+and `darkroom stop` (or Ctrl-C) stops them all. Mind the machine: three browsers rendering
+WebGL in software need three times the memory; give heavy shots a `lock`.
+
+### Several runs on one manifest
 
 Several runs may shoot one manifest at once (`--only A` in one shell, `--only B` in another):
 `.darkroom/state.json` is updated under its own lock and written atomically, so neither run
@@ -473,6 +575,25 @@ documentation and are left alone, so a README can show how to write them.
 
 A shot's `gallery` options change how it is shown: `"width": 480` writes an `<img>` tag with
 that width instead of `![...](...)`, and `"poster": true` puts a clip's poster beside its GIF.
+
+**A table per device.** Phone, tablet and desktop stills of the same screens read best side by
+side. `darkroom gallery media.json --layout table --by device` (or `"gallery": {"layout":
+"table", "by": "device"}` in the manifest) writes an HTML table, which GitHub renders in a
+README or PR body: a row per screen, a column per device.
+
+```html
+<table>
+<tr><th></th><th>phone</th><th>desktop</th></tr>
+<tr><td><b>title</b></td><td><img src="media/title-phone.jpg" alt="..." width="182"></td><td><img src="media/title-desktop.jpg" alt="..." width="640"></td></tr>
+</table>
+```
+
+A screen is a named capture (`title-{value}`), an `each` value, or a plain still; the device's
+name is dropped from it (`title-phone` and `title-desktop` are the row `title`), and
+`"gallery": {"row": "..."}` names a plain still's row. Column widths give every device the same
+image height across about 880 px; `"widths": {"phone": 200}` sets them yourself. Clips, pairs
+and grids follow the table as usual. `--format html` puts the same table above the cards, and a
+per-shot marker gets a table of that shot. `--layout list` turns it off for one call.
 
 **Links.** The project root is the git work tree holding the manifest (or the manifest's
 folder outside git). When the document is inside it, links are relative to the document.
