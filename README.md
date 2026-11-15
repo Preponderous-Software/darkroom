@@ -138,7 +138,7 @@ Every shot:
 | Key | Meaning |
 |---|---|
 | `name` | Unique; becomes the file name (`name.jpg`, `name.gif`, ...). |
-| `kind` | `still` (one image, or one per named `capture`), `clip` (frames from `capture` steps), `pair` (before/after) or `grid` (a captioned composite of other shots). |
+| `kind` | `still` (one image, or one per named `capture` or command `outputs` entry), `clip` (frames from `capture` steps), `pair` (before/after), `grid` (a captioned composite of other shots) or `prep` (a command that writes files, not images; see [Prep shots, inputs and depends](#prep-shots-inputs-and-depends)). |
 | `backend` | `web` (default) or `command`. |
 | `device` | `desktop` (1280x720), `hd` (1920x1080), `phone` (390x844, DPR 3, touch, mobile), `landscape-phone` (844x390), a custom name, or an inline `{ "width", "height", ... }`. |
 | `caption`, `alt` | Used by the gallery. Say so in `alt` if `speed` > 1. |
@@ -156,6 +156,8 @@ Every shot:
 | `retries`, `timeout`, `lock` | Attempts after the first (2), seconds per attempt, a lock name. |
 | `gallery` | How the gallery shows the shot: `{ "width": 480 }` writes `<img ... width="480">`; `"poster": true` shows a clip's poster beside its GIF (and makes the poster). Changing it never reshoots. |
 | `skip` | Leave the shot out of `shoot`. |
+| `inputs` | Paths or globs (relative to the manifest, templated) whose file contents feed the capture hash: a changed, added or removed file reshoots the shot. A directory stands for every file under it. |
+| `depends` | Shot names that run first. A `prep` named here also runs under `--only` (unless it is up to date), and its `outputs` count as this shot's `inputs`. |
 
 ### The web backend
 
@@ -173,6 +175,8 @@ Every shot:
 | `failOnConsoleError` | Fail the attempt if the page logs an error (errors are always reported). |
 | `userAgent`, `block` | darkroom appends `darkroom-monitor` to Chromium's user agent, so sites that count visits can skip captures. `block` is a list of URL patterns to abort (analytics, scores). |
 | `launchArgs` | Chromium flags. The default renders WebGL with SwiftShader, so it works headless and in CI. |
+| `initScript` | JS that runs in every page before the page's own scripts (Playwright's `addInitScript`): seed `localStorage` or a save file, or wrap `requestAnimationFrame` with a clock you can freeze. A string (vars filled in, like `url`), `{ "file": "tools/capture-init.js" }` (relative to the manifest; the path is templated, the file is sent as it is), or a list of those, run in order. A file's contents feed the capture hash. |
+| `context` | Extra Playwright `browser.newContext` options, passed through: `locale`, `timezoneId`, `colorScheme`, `reducedMotion`, `geolocation`, `permissions`, `extraHTTPHeaders`, ... String values are templated. `viewport`, `deviceScaleFactor`, `hasTouch`, `isMobile` and `screen` come from `device`, and `userAgent` from `userAgent`. |
 
 Steps (one verb per object):
 
@@ -204,10 +208,44 @@ Steps (one verb per object):
 | `xvfb` | `true` (or `{ "args": [...] }`) runs the program on a private Xvfb display sized to the device. Xvfb picks a free display number itself, so parallel captures never collide; `{display}` and `$DISPLAY` hold it. Xvfb and the program run with software OpenGL (`LIBGL_ALWAYS_SOFTWARE=1`, `GALLIUM_DRIVER=llvmpipe`), which keeps GLX working where a host GPU driver would crash it (e.g. NVIDIA under WSL), so the program gets real OpenGL; `{ "env": {...} }` replaces those variables and `{ "env": {} }` drops them. If Xvfb still crashes at startup, darkroom starts it once more without GLX and warns. |
 | `repeat` | Run the program `n` times with `{i}` and `{n}` set; every image from every run is a frame, in order (camera orbits, scenario steps). `each` (above) does the same with a value per run. |
 | `glob` | Which files to collect (default: every PNG, JPEG, WebP or BMP, sorted). |
+| `outputs` | Stills: named outputs from one run. `{ "top": "top.png", "oblique": "oblique.png" }` maps files the program writes into `{out_dir}` to `<name>-top.jpg` and `<name>-oblique.jpg` (or the `file` template with `{key}`, e.g. `"docs/views/{key}.png"`); other files it writes are ignored, and a missing one fails the attempt. An entry can be `{ "file": "top.png", "caption": "...", "alt": "..." }` to give that image its own gallery caption and alt text (changing them never reshoots). Not with `each`, `repeat` or `glob`. |
 
 `examples/recipes/media.json` shows a native game with its own screenshot flags at two
 sizes, an engine's headless renderer, two builds compared as a pair, a RAM-heavy rig
 behind a lock, and one still per season composed into a captioned grid.
+
+### Prep shots, inputs and depends
+
+Some captures need a slow run that writes data, not images: a throwaway server and a few bots
+for several minutes, a simulation, a build. A `prep` shot runs such a command once, and cheap
+shots render images from what it wrote:
+
+```json
+{
+  "shots": [
+    { "name": "rig", "kind": "prep", "lock": "server",
+      "argv": ["./tools/run-rig.sh", "--minutes", "5"], "outputs": ["build/rig/stats.json"] },
+    { "name": "stats-chart", "backend": "command", "depends": ["rig"],
+      "argv": ["python3", "tools/chart.py", "build/rig/stats.json", "{out_dir}/chart.png"] }
+  ]
+}
+```
+
+A prep takes `argv`, `env`, `cwd`, `xvfb` (with `device` for its size), `lock`, `timeout`,
+`retries`, `inputs`, `depends` and `outputs` (required): the files it writes, relative to the
+manifest. Its default `cwd` is the manifest's folder, since writing files there is its job.
+It is up to date (and skipped) when its argv, env, vars and inputs have not changed and every
+declared output still exists; a missing output after the run fails it. It makes no media and
+does not appear in the gallery. `--force` reruns it only when it was selected (no `--only`, or
+named in `--only`). `--encode` leaves it alone; under `--tag` it still runs, untagged (a tag
+never goes into a prep's name or state).
+
+`depends` orders shots: each runs after the shots it names (otherwise manifest order, with
+pairs and grids last). `darkroom shoot --only stats-chart` also runs `rig` first, unless it is
+up to date. When a shot fails, the shots that depend on it are skipped and counted as failed.
+A shot that depends on a prep treats the prep's outputs as `inputs`, so new data reshoots it.
+`inputs` works on any shot: `"inputs": ["scenes/*.json", "assets/"]` reshoots when a matching
+file changes, appears or disappears.
 
 ### Shared flags: list vars and `KEY+`
 
@@ -284,7 +322,8 @@ hash) and a contact sheet. Add `.darkroom/` to your `.gitignore`.
 `darkroom shoot` keeps two hashes per shot:
 
 - the **capture hash**: only what changes the pixels captured (the url or argv, steps, setup,
-  device, adapter, ready, css, crop, the vars, and so on). When it changes, the shot is reshot.
+  device, adapter, ready, css, crop, `initScript`, `context`, the vars, the contents of the
+  shot's `inputs`, and so on). When it changes, the shot is reshot.
 - the **encode hash**: what changes the files made from a take (format, quality, width, `gif`,
   `video`, `poster`, `sheet`, `aspect`, `speed`, `fps`, `every`, `colors`, `file`, budgets).
   When only this changes, the saved take is re-encoded without reshooting.
@@ -386,6 +425,13 @@ absolute path.
 
 `0` everything worked; `1` at least one shot failed (the others still ran); `2` the manifest
 is invalid, a name is unknown, or the gallery cannot link a document (see **Links** above).
+
+`darkroom check` also warns, without failing, about things that look wrong but may be fine at
+shoot time: a command shot's (or prep's) program that is not on `PATH` or not at its path,
+relative path-looking `argv` entries (with a `/`, or a script or data extension such as `.py`
+or `.json`) that do not exist, `inputs` that match no files and `initScript` files that do
+not exist. Paths a prep declares in `outputs` and entries filled in at run time (`{out_dir}`,
+`{value}`, ...) are not reported.
 
 ## Credits
 
