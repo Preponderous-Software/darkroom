@@ -21,6 +21,7 @@ import secrets
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -152,19 +153,26 @@ def kill_tree(pid: int, grace: float = GRACE, also_group: bool = True) -> None:
 # ------------------------------------------------------------------ the run registry
 
 class Run:
-    """This process's entry in the run registry."""
+    """This process's entry in the run registry. Thread-safe: with ``shoot --jobs N`` several
+    shots run at once, so ``shots`` lists every current one (``shot`` joins them for ``ps``)."""
 
     def __init__(self, manifest: str | None, argv: list[str] | None = None):
         self.id = secrets.token_hex(3)
+        self.lock = threading.RLock()
+        self.closing = False
         self.path = run_dir() / f"{self.id}.json"
         self.data = {
             "id": self.id, "pid": os.getpid(), "pgid": os.getpgid(0) if POSIX else None,
             "start": proc_start(os.getpid()), "manifest": manifest, "cwd": os.getcwd(),
             "started": _dt.datetime.now().isoformat(timespec="seconds"), "argv": argv or sys.argv,
-            "shot": None, "groups": {},
+            "shot": None, "shots": [], "groups": {},
         }
 
     def save(self) -> None:
+        with self.lock:
+            self._save()
+
+    def _save(self) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             tmp = self.path.with_name(f".{self.id}.{os.getpid()}.tmp")
@@ -174,21 +182,47 @@ class Run:
             pass  # the registry is a convenience; never fail a shoot over it
 
     def set_shot(self, name: str | None) -> None:
-        self.data["shot"] = name
-        self.save()
+        with self.lock:
+            self.data["shots"] = [name] if name else []
+            self.data["shot"] = name
+            self._save()
+
+    def add_shot(self, name: str) -> None:
+        with self.lock:
+            self.data["shots"].append(name)
+            self.data["shot"] = ", ".join(self.data["shots"])
+            self._save()
+
+    def remove_shot(self, name: str) -> None:
+        with self.lock:
+            if name in self.data["shots"]:
+                self.data["shots"].remove(name)
+            self.data["shot"] = ", ".join(self.data["shots"]) or None
+            self._save()
 
     def add_group(self, pid: int, argv) -> None:
-        self.data["groups"][str(pid)] = {"start": proc_start(pid), "argv": [str(a) for a in argv][:6]}
-        self.save()
+        with self.lock:
+            self.data["groups"][str(pid)] = {"start": proc_start(pid), "argv": [str(a) for a in argv][:6]}
+            self._save()
 
     def drop_group(self, pid: int) -> None:
-        if self.data["groups"].pop(str(pid), None) is not None:
-            self.save()
+        with self.lock:
+            if self.data["groups"].pop(str(pid), None) is not None:
+                self._save()
 
     def kill_all(self, grace: float = GRACE) -> None:
-        for pid in list(self.data["groups"]):
+        with self.lock:
+            pids = list(self.data["groups"])
+        for pid in pids:
             kill_tree(int(pid), grace)
-        self.data["groups"] = {}
+        with self.lock:
+            self.data["groups"] = {}
+
+    def close_down(self, grace: float = GRACE) -> None:
+        """Refuse new children (``spawn`` raises ``Stopped``), then kill the running ones: worker
+        threads waiting on them see them exit and unwind."""
+        self.closing = True
+        self.kill_all(grace)
 
     def end(self) -> None:
         with contextlib.suppress(OSError):
@@ -201,6 +235,25 @@ _stopping = False
 
 def current() -> Run | None:
     return _current
+
+
+def check_stopping() -> None:
+    """Raise ``Stopped`` once the run is closing down (called before starting or waiting)."""
+    if _current is not None and _current.closing:
+        raise Stopped("the run is stopping")
+
+
+@contextlib.contextmanager
+def shot_scope(name: str):
+    """Record NAME as one of the run's current shots while the block runs (``darkroom ps``)."""
+    run = _current
+    if run is not None:
+        run.add_shot(name)
+    try:
+        yield
+    finally:
+        if run is not None:
+            run.remove_shot(name)
 
 
 def _on_signal(signum, frame):
@@ -249,9 +302,12 @@ def spawn(argv, **kw) -> subprocess.Popen:
     """Popen in a new session (its own process group), registered with the current run."""
     if POSIX:
         kw.setdefault("start_new_session", True)
+    check_stopping()
     p = subprocess.Popen(argv, **kw)
     if _current is not None:
         _current.add_group(p.pid, argv)
+        if _current.closing:  # closed down while it started: it must not outlive the run
+            kill_tree(p.pid)
     return p
 
 

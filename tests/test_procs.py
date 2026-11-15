@@ -162,7 +162,7 @@ def test_stop_needs_exactly_one_target(capsys):
 
 def test_in_process_shoot_registers_and_cleans_up(write_manifest, fake_cmd, run_dir):
     seen = []
-    orig = procs.Run.set_shot
+    orig = procs.Run.add_shot
 
     def spy(self, name):
         seen.append((name, json.loads(self.path.read_text())["pid"]))
@@ -171,11 +171,11 @@ def test_in_process_shoot_registers_and_cleans_up(write_manifest, fake_cmd, run_
     p = write_manifest({"shots": [{"name": "t", "kind": "still", "backend": "command",
                                    "device": {"width": 32, "height": 32},
                                    "argv": fake_cmd + ["{out_dir}", "{width}", "{height}"]}]})
-    procs.Run.set_shot = spy
+    procs.Run.add_shot = spy
     try:
         assert main(["shoot", str(p)]) == 0
     finally:
-        procs.Run.set_shot = orig
+        procs.Run.add_shot = orig
     assert seen == [("t", os.getpid())]
     assert list(run_dir.glob("*.json")) == []
     assert procs.current() is None

@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
 from pathlib import Path
 
@@ -53,7 +54,7 @@ class State:
 
     def put(self, key, entry):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with _file_lock(self.path.with_name("state.lock")):
+        with _THREADS, _file_lock(self.path.with_name("state.lock")):
             self.data = self._read()
             self.data[key] = entry
             tmp = self.path.with_name(f".state.{os.getpid()}.tmp")
@@ -75,6 +76,9 @@ def _file_lock(path: Path):
         yield
     finally:
         os.close(fd)
+
+
+_THREADS = threading.Lock()  # shoot --jobs: one state write at a time within this process too
 
 
 def take_dir(m: Manifest, key: str) -> Path:
@@ -109,7 +113,7 @@ def output_base(m: Manifest, shot: Shot, tag: str | None, variables: dict | None
     f = shot.get("file")
     if not f:
         return m.out_dir / base_name(shot, tag)
-    p = m.dir / template(f, {**m.vars, "name": shot.name, "tag": tag or "", **(variables or {})})
+    p = m.dir / template(f, {**m.shot_vars(shot), "name": shot.name, "tag": tag or "", **(variables or {})})
     stem = p.parent / p.name[: len(p.name) - len(p.suffix)] if p.suffix else p
     if m.out_override is not None:  # shoot --out: review copies, never the real files
         stem = m.out_dir / stem.name
@@ -130,13 +134,55 @@ def _rel(m: Manifest, p: Path) -> str:
     return str(Path(p).resolve().relative_to(m.dir)) if Path(p).resolve().is_relative_to(m.dir) else str(p)
 
 
-def capture_take(m: Manifest, shot: Shot, tag: str | None, retries: int, log=say) -> dict:
-    """Run the backend (fresh browser / process each attempt) and save frames + meta.json."""
+def device_label(m: Manifest, shot: Shot, variables: dict | None = None) -> str:
+    """A device's name for logs and the gallery: its name, or WIDTHxHEIGHT for an inline one."""
+    name = m.device_name(shot, variables)
+    if name is not None:
+        return name
+    d = m.device(shot.get("device"))
+    return f"{d['width']}x{d['height']}"
+
+
+def console_types(shot: Shot) -> set[str]:
+    """The console message types that fail an attempt (``failOnConsole``; ``failOnConsoleError``
+    is the same as ``["error"]``)."""
+    types = set(shot.get("failOnConsole") or [])
+    if shot.get("failOnConsoleError"):
+        types.add("error")
+    return types
+
+
+def _console_failures(console: list[dict], errs: list[str], types: set[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for c in console:
+        t = "error" if c.get("type") == "pageerror" else c.get("type")
+        if t in types:
+            counts[t] = counts.get(t, 0) + 1
+    if "error" in types and not console and errs:  # a result without the full log
+        counts["error"] = len(errs)
+    return counts
+
+
+def capture_take(m: Manifest, shot: Shot, tag: str | None, retries: int, log=say, session=None) -> dict:
+    """Run the backend (fresh browser / process each attempt) and save frames + meta.json.
+    With a web ``session``, the steps run on the session's page; a failed attempt closes the
+    session, so a retry starts with a fresh page."""
     key = base_name(shot, tag)
     tdir = take_dir(m, key)
-    device = m.device(shot.get("device", "desktop"))
-    variables = dict(m.vars, tag=tag or "")
+    variables = dict(m.shot_vars(shot), tag=tag or "")
+    try:
+        if m.device_varies(shot):
+            device_for = lambda v: m.shot_device(shot, v)  # noqa: E731
+            device = device_for(m.run_vars(shot, 0))
+            devices = [device_label(m, shot, m.run_vars(shot, i)) for i in range(len(shot["each"]))]
+        else:
+            device_for = None
+            device = m.shot_device(shot, variables)
+            devices = [device_label(m, shot, variables)]
+    except KeyError as e:
+        raise CaptureError(str(e.args[0] if e.args else e))
     attempts = 1 + retries
+    fail_on = console_types(shot)
     last: Exception | None = None
     for attempt in range(1, attempts + 1):
         frames_dir = tdir / "frames"
@@ -144,17 +190,37 @@ def capture_take(m: Manifest, shot: Shot, tag: str | None, retries: int, log=say
             shutil.rmtree(frames_dir)
         try:
             t0 = time.monotonic()
-            with lock(shot.get("lock"), timeout=shot.get("lockTimeout"), on_wait=_lock_wait(key, log)):
-                result = BACKENDS[shot.backend](shot, device, variables, frames_dir, log=log)
+            if session is not None:
+                # The session holds the shot's lock from opening the page until it closes.
+                hold = lambda: lock(shot.get("lock"), timeout=shot.get("lockTimeout"),  # noqa: E731
+                                    on_wait=_lock_wait(key, log))
+                result = session.shot(shot, device, variables, frames_dir, log=log, hold_lock=hold)
+                result["runs"] = [0] * len(result["frames"])
+            else:
+                with lock(shot.get("lock"), timeout=shot.get("lockTimeout"), on_wait=_lock_wait(key, log)):
+                    kw = {"device_for": device_for} if device_for else {}
+                    result = BACKENDS[shot.backend](shot, device, variables, frames_dir, log=log, **kw)
             if not result["frames"]:
                 raise CaptureError("no frames captured")
             for warning in result.get("warnings") or []:
                 log(f"  {key}: {warning}")
             errs = result.get("consoleErrors") or []
+            console = result.get("console") or []
             for e in errs[:5]:
                 log(f"  {key}: page error: {e[:200]}")
-            if errs and shot.get("failOnConsoleError"):
-                raise CaptureError(f"{len(errs)} console error(s) and failOnConsoleError is set")
+            if shot.backend == "web":
+                tdir.mkdir(parents=True, exist_ok=True)
+                with open(tdir / "console.jsonl", "w") as f:
+                    for c in console:
+                        f.write(json.dumps(c) + "\n")
+                warns = sum(1 for c in console if c.get("type") == "warning")
+                if warns:
+                    log(f"  {key}: {warns} console warning(s) (see .darkroom/takes/{key}/console.jsonl)")
+            bad = _console_failures(console, errs, fail_on)
+            if bad:
+                what = ", ".join(f"{n} console {t}(s)" for t, n in sorted(bad.items()))
+                setting = "failOnConsole" if shot.get("failOnConsole") else "failOnConsoleError"
+                raise CaptureError(f"{what} and {setting} is set")
             meta = {"shot": shot.name, "tag": tag, "kind": shot.kind, "backend": shot.backend,
                     "manifest": m.path.name, "out": m.data.get("out", "media"),
                     "device": device, "frames": [Path(f).name for f in result["frames"]],
@@ -162,6 +228,14 @@ def capture_take(m: Manifest, shot: Shot, tag: str | None, retries: int, log=say
                     "consoleErrors": errs, "seconds": round(time.monotonic() - t0, 1),
                     "attempt": attempt, "when": _dt.datetime.now().isoformat(timespec="seconds"),
                     "darkroom": __version__, "capture_hash": m.capture_hash(shot, tag)}
+            meta["devices"] = devices
+            if shot.backend == "web":
+                counts: dict[str, int] = {}
+                for c in console:
+                    counts[c.get("type")] = counts.get(c.get("type"), 0) + 1
+                meta["console"] = counts
+            if session is not None:
+                meta["session"] = session.name
             if any(result.get("captions") or []):
                 meta["captions"] = result["captions"]
             if any(result.get("names") or []):
@@ -170,11 +244,20 @@ def capture_take(m: Manifest, shot: Shot, tag: str | None, retries: int, log=say
             return meta
         except (CaptureError, LockTimeout, OSError, ValueError) as e:
             last = e
+            if session is not None:
+                session.close()  # a failed shot discards the session; a retry starts fresh
             msg = [l for l in _ANSI.sub("", str(e)).strip().splitlines() if l.strip() and "Call log" not in l]
             log(f"  {key}: attempt {attempt}/{attempts} failed: {msg[0] if msg else e}")
             for extra in msg[1:4]:
                 log(f"      {extra}")
     raise CaptureError(f"{key}: all {attempts} attempt(s) failed: {last}")
+
+
+def strip_device(text: str, device: str | None) -> str:
+    """A screen's row name: TEXT without the device's name ("title-phone" -> "title")."""
+    if device:
+        text = re.sub(rf"(^|[-_.]){re.escape(device)}(?=$|[-_.])", "", text)
+    return text.strip("-_.")
 
 
 def load_frames(m: Manifest, key: str, shot: Shot | None = None):
@@ -207,10 +290,20 @@ def sheet_labels(mode: str, meta: dict) -> str | list:
     return mode
 
 
-def encode_take(m: Manifest, shot: Shot, tag: str | None, log=say) -> list[str]:
-    """Encode a saved take into the output dir. Returns output paths relative to the manifest."""
+def encode_take(m: Manifest, shot: Shot, tag: str | None, log=say, cells: list | None = None) -> list[str]:
+    """Encode a saved take into the output dir. Returns output paths relative to the manifest.
+    ``cells`` (a list) gets one {"file", "row", "device"} per still, for the gallery's table."""
     key = base_name(shot, tag)
     frames, meta = load_frames(m, key, shot)
+    runs = meta.get("runs") or [0] * len(frames)
+    devices = meta.get("devices") or [device_label(m, shot)]
+    row_default = (shot.get("gallery") or {}).get("row") if isinstance(shot.get("gallery"), dict) else None
+
+    def cell(r: enc.Result, row: str, k: int) -> None:
+        if cells is not None:
+            dev = devices[runs[k]] if runs[k] < len(devices) else devices[0]
+            cells.append({"file": _rel(m, r.path), "row": strip_device(str(row), dev) or row_default or shot.name,
+                          "device": dev})
     budgets = m.budgets(shot)
     base = output_base(m, shot, tag)
 
@@ -237,14 +330,18 @@ def encode_take(m: Manifest, shot: Shot, tag: str | None, log=say) -> list[str]:
                     path = at(f"-{okey}{ext}")
                 results.append(enc.encode_still(by_key[okey], path, budgets["still_kb"], fmt,
                                                 shot.get("quality", 86), shot.get("width"), colors))
+                cell(results[-1], okey, names.index(okey))
         elif any(names):
             # Named captures: one still per name, beside the shot's other outputs.
             suffix = f".{tag}" if tag else ""
+            if len([n for n in names if n]) != len({n for n in names if n}):
+                raise CaptureError(f"{key}: the saved take names one capture twice; reshoot it")
             for k, name in enumerate(names):
                 if name:
                     results.append(enc.encode_still(frames[k], base.parent / f"{name}{suffix}{ext}",
                                                     budgets["still_kb"], fmt, shot.get("quality", 86),
                                                     shot.get("width"), colors))
+                    cell(results[-1], name, k)
         elif shot.get("each"):
             # One still per value: the last frame of each run.
             values = shot["each"]
@@ -258,9 +355,13 @@ def encode_take(m: Manifest, shot: Shot, tag: str | None, log=say) -> list[str]:
                     path = at(f"-{slug(value)}{ext}")
                 results.append(enc.encode_still(frames[k], path, budgets["still_kb"], fmt,
                                                 shot.get("quality", 86), shot.get("width"), colors))
+                # The row is the value, unless the value is the device ("device": "{value}").
+                dev = devices[run] if run < len(devices) else devices[0]
+                cell(results[-1], "" if str(value) == dev else value, k)
         else:
             results.append(enc.encode_still(frames[-1], at(ext), budgets["still_kb"], fmt,
                                             shot.get("quality", 86), shot.get("width"), colors))
+            cell(results[-1], row_default or shot.name, len(frames) - 1)
     else:
         gif = shot.get("gif", {})
         fps = float(shot.get("fps", (gif or {}).get("fps", 12))) * float(shot.get("speed", 1))
@@ -430,7 +531,7 @@ def run_prep(m: Manifest, shot: Shot, state: State, retries: int, force: bool, l
     every declared output still exists."""
     key = shot.name
     cap_h = m.capture_hash(shot, None)
-    outputs = [str(o) for o in template(shot["outputs"], m.vars)]
+    outputs = [str(o) for o in template(shot["outputs"], m.shot_vars(shot))]
     prev = state.get(key) or {}
     if not force and prev.get("capture_hash") == cap_h and all((m.dir / o).exists() for o in outputs):
         log(f"= {key}: up to date (use --force to rerun)")
@@ -443,7 +544,7 @@ def run_prep(m: Manifest, shot: Shot, state: State, retries: int, force: bool, l
         try:
             t0 = time.monotonic()
             with lock(shot.get("lock"), timeout=shot.get("lockTimeout"), on_wait=_lock_wait(key, log)):
-                command_backend.run_prep(shot, device, dict(m.vars, tag=""), log=log)
+                command_backend.run_prep(shot, device, dict(m.shot_vars(shot), tag=""), log=log)
             absent = [o for o in outputs if not (m.dir / o).exists()]
             if absent:
                 raise CaptureError(f"the prep did not write {', '.join(absent)} (its declared outputs)")
@@ -462,13 +563,6 @@ def run_prep(m: Manifest, shot: Shot, state: State, retries: int, force: bool, l
     raise CaptureError(f"{key}: all {attempts} attempt(s) failed: {last}")
 
 
-def _mark(key: str) -> None:
-    """Record the shot under way in the run registry (``darkroom ps`` shows it)."""
-    run = procs.current()
-    if run is not None:
-        run.set_shot(key)
-
-
 def _lock_wait(key: str, log):
     def waiting(path):
         holder = lock_holder(path)
@@ -476,9 +570,196 @@ def _lock_wait(key: str, log):
     return waiting
 
 
-def shoot(m: Manifest, only=None, tag=None, retries=None, force=False, encode_only=False, log=say) -> int:
-    """Shoot (or with encode_only, re-encode the last takes of) the selected shots.
-    Returns the number of failed shots."""
+def units(order: list[Shot]) -> list[list[Shot]]:
+    """Group the plan into units of work: a run of consecutive web shots with the same
+    ``session`` is one unit (they share a page, in order); every other shot is its own."""
+    out: list[list[Shot]] = []
+    for shot in order:
+        name = shot.get("session") if shot.backend == "web" and not shot.composite else None
+        if name and out and out[-1][0].get("session") == name and out[-1][0].backend == "web":
+            out[-1].append(shot)
+        else:
+            out.append([shot])
+    return out
+
+
+class _Shooter:
+    """One ``shoot``: runs units of work in plan order, or with ``jobs`` > 1, several at once.
+    A unit starts once the shots it depends on have finished, never beside a running unit that
+    uses one of its ``lock`` names, and pairs and grids start after every other shot."""
+
+    def __init__(self, m: Manifest, state: State, only, tag, retries, force, encode_only, log, jobs: int):
+        import threading
+        self.m, self.state, self.only, self.tag = m, state, only, tag
+        self.retries, self.force, self.encode_only = retries, force, encode_only
+        self.jobs = max(1, int(jobs or 1))
+        self._log = log
+        self.failed = 0
+        self.broken: set[str] = set()  # shots that failed (or were skipped for it) in this run
+        self.mutex = threading.Lock()
+        self._print = threading.Lock()
+
+    def logger(self, key: str):
+        """With jobs > 1 every line a shot logs starts with ``[key]``."""
+        if self.jobs == 1:
+            return self._log
+
+        def log(msg: str) -> None:
+            with self._print:
+                self._log(f"[{key}] {msg}")
+        return log
+
+    def fail(self, name: str) -> None:
+        with self.mutex:
+            self.failed += 1
+            self.broken.add(name)
+
+    def run_unit(self, unit: list[Shot]) -> None:
+        session = None
+        if unit[0].get("session") and unit[0].backend == "web" and not unit[0].composite:
+            from .backends.web import WebSession
+            session = WebSession(unit[0]["session"], self.logger(f"session {unit[0]['session']}"))
+        try:
+            for shot in unit:
+                self.run_shot(shot, session)
+        finally:
+            if session is not None:
+                session.close()
+
+    def run_shot(self, shot: Shot, session=None) -> None:
+        m, state, tag, only = self.m, self.state, self.tag, self.only
+        key = base_name(shot, None if shot.prep else tag)
+        log = self.logger(key)
+        with self.mutex:
+            bad = [d for d in shot.get("depends") or [] if d in self.broken]
+        if bad:
+            self.fail(shot.name)
+            log(f"! {key}: skipped: depends on " + ", ".join(f"'{d}'" for d in bad) + ", which failed")
+            return
+        retries = shot.get("retries", 2) if self.retries is None else self.retries
+        if shot.prep:
+            if self.encode_only:
+                return  # a prep makes no images, so there is nothing to re-encode
+            with procs.shot_scope(shot.name):
+                try:
+                    run_prep(m, shot, state, retries, self.force and (not only or shot.name in only), log)
+                except Exception as e:
+                    self.fail(shot.name)
+                    log(f"! {shot.name}: FAILED: {str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__}")
+            return
+        # A review shoot (--out) keeps its own record, so the real outputs' entry is untouched.
+        skey = key if m.out_override is None else f"{key}@{m.out_dir}"
+        try:
+            cap_h, enc_h = m.capture_hash(shot, tag), m.encode_hash(shot, tag)
+        except KeyError as e:  # e.g. --var gave "device": "{dev}" a name that is not a device
+            self.fail(shot.name)
+            log(f"! {key}: FAILED: {e.args[0] if e.args else e}")
+            return
+        prev = state.get(skey) or {}
+        outputs_ok = bool(prev) and all((m.dir / o).exists() for o in prev.get("outputs", []))
+        if (prev.get("adopted") and not self.force and not self.encode_only and outputs_ok
+                and prev.get("capture_hash") == cap_h and prev.get("encode_hash") == enc_h):
+            # Recorded by `shoot --adopt` (outputs committed, no take here): up to date until it changes.
+            log(f"= {key}: up to date (adopted; use --force to reshoot)")
+            return
+        reencode = False
+        if not shot.composite and not self.force and not self.encode_only:
+            take = take_capture_hash(m, key)
+            if take is None and prev.get("hash") and "capture_hash" not in prev and outputs_ok and any(
+                    prev["hash"] == m.legacy_hash(shot, tag, v) for v in LEGACY_VERSIONS):
+                # State from darkroom 0.1/0.2 for this exact shot: adopt it instead of reshooting.
+                state.put(skey, dict(prev, capture_hash=cap_h, encode_hash=enc_h, darkroom=__version__))
+                _stamp_take(m, key, cap_h)
+                log(f"= {key}: up to date (use --force to reshoot)")
+                return
+            if take == cap_h:
+                if prev.get("encode_hash") == enc_h and outputs_ok:
+                    log(f"= {key}: up to date (use --force to reshoot)")
+                    return
+                reencode = True
+        with procs.shot_scope(key):
+            log(f"> {key} ({shot.kind}{'' if shot.composite else ', ' + shot.backend})"
+                + (": capture unchanged, re-encoding the saved take" if reencode else ""))
+            try:
+                cells: list[dict] = []
+                if shot.kind == "pair":
+                    outputs = make_pair(m, shot, log)
+                elif shot.kind == "grid":
+                    outputs = make_grid(m, shot, log)
+                else:
+                    if not (self.encode_only or reencode):
+                        capture_take(m, shot, tag, retries, log, session=session)
+                    elif not (take_dir(m, key) / "meta.json").exists():
+                        raise CaptureError(f"{key}: no saved take to re-encode; shoot it first")
+                    outputs = encode_take(m, shot, tag, log, cells=cells)
+                entry = {"hash": m.shot_hash(shot, tag), "capture_hash": cap_h, "encode_hash": enc_h,
+                         "outputs": outputs, "tag": tag, "darkroom": __version__,
+                         "when": _dt.datetime.now().isoformat(timespec="seconds")}
+                if cells:
+                    entry["cells"] = cells
+                state.put(skey, entry)
+            except Exception as e:  # one failing shot doesn't stop the others
+                self.fail(shot.name)
+                log(f"! {key}: FAILED: {str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__}")
+
+    def run(self, work: list[list[Shot]]) -> None:
+        if self.jobs == 1:
+            for unit in work:
+                self.run_unit(unit)
+            return
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+        in_run = {s.name for u in work for s in u}
+        pending = list(work)
+        running: dict = {}
+        finished: set[str] = set()
+
+        def locks(u):
+            return {s.get("lock") for s in u if s.get("lock")}
+
+        def ready(u) -> bool:
+            names = {s.name for s in u}
+            deps = {d for s in u for d in s.get("depends") or []} - names
+            if any(d in in_run and d not in finished for d in deps):
+                return False
+            if u[0].composite:  # pairs and grids read other shots' takes: they go last
+                return not any(not v[0].composite for v in pending) and \
+                    not any(not v[0].composite for v in running.values())
+            return True
+
+        pool = ThreadPoolExecutor(max_workers=self.jobs, thread_name_prefix="darkroom-shot")
+        try:
+            while pending or running:
+                busy = set().union(*(locks(u) for u in running.values()))
+                for u in list(pending):
+                    if len(running) >= self.jobs:
+                        break
+                    if ready(u) and not (locks(u) & busy):
+                        pending.remove(u)
+                        running[pool.submit(self.run_unit, u)] = u
+                        busy |= locks(u)
+                if not running:  # cannot happen with a valid plan; keep going in order
+                    u = pending.pop(0)
+                    running[pool.submit(self.run_unit, u)] = u
+                done, _ = wait(list(running), timeout=0.5, return_when=FIRST_COMPLETED)
+                for f in done:
+                    u = running.pop(f)
+                    finished |= {s.name for s in u}
+                    f.result()  # an unexpected error (not a shot failure) stops the run
+        except BaseException:
+            # Ctrl-C, a stop or an unexpected error: stop starting processes, kill the ones the
+            # workers are waiting on, then let the workers finish unwinding.
+            run = procs.current()
+            if run is not None:
+                run.close_down()
+            pool.shutdown(wait=True, cancel_futures=True)
+            raise
+        pool.shutdown(wait=True)
+
+
+def shoot(m: Manifest, only=None, tag=None, retries=None, force=False, encode_only=False, log=say,
+          jobs: int = 1) -> int:
+    """Shoot (or with encode_only, re-encode the last takes of) the selected shots, ``jobs`` at
+    a time. Returns the number of failed shots."""
     state = State(m)
     if only:
         present = {s.name for s in m.shots if not s.get("skip")}
@@ -487,70 +768,85 @@ def shoot(m: Manifest, only=None, tag=None, retries=None, force=False, encode_on
             log(f"no shot named '{name}'")
         if missing:
             return len(missing)
-    failed = 0
-    broken: set[str] = set()  # shots that failed (or were skipped for it) in this run
-    for shot in plan(m, only):
-        if shot.composite and tag:
-            continue
-        bad = [d for d in shot.get("depends") or [] if d in broken]
-        if bad:
-            failed += 1
-            broken.add(shot.name)
-            log(f"! {base_name(shot, None if shot.prep else tag)}: skipped: depends on "
-                + ", ".join(f"'{d}'" for d in bad) + ", which failed")
-            continue
-        if shot.prep:
-            if encode_only:
-                continue  # a prep makes no images, so there is nothing to re-encode
-            _mark(shot.name)
-            try:
-                run_prep(m, shot, state, shot.get("retries", 2) if retries is None else retries,
-                         force and (not only or shot.name in only), log)
-            except Exception as e:
-                failed += 1
-                broken.add(shot.name)
-                log(f"! {shot.name}: FAILED: {str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__}")
+    order = [s for s in plan(m, only) if not (s.composite and tag)]
+    shooter = _Shooter(m, state, only, tag, retries, force, encode_only, log, jobs)
+    shooter.run(units(order))
+    return shooter.failed
+
+
+def expected_outputs(m: Manifest, shot: Shot, tag: str | None = None) -> list[Path]:
+    """The files a shot makes, worked out from the manifest alone (no take): what ``--adopt``
+    checks before recording a shot as up to date."""
+    from .backends.web import template_steps
+    from .manifest import _named_captures
+    base = output_base(m, shot, tag)
+
+    def at(suffix: str) -> Path:
+        return base.parent / (base.name + suffix)
+    if shot.kind in ("still", "pair", "grid"):
+        fmt, ext = still_format(shot)
+        if shot.kind != "still":
+            return [at(ext)]
+        named = shot.named_outputs()
+        if named and shot.backend == "command":
+            templated = "{key}" in (shot.get("file") or "")
+            return [(lambda b: b.parent / (b.name + ext))(output_base(m, shot, tag, {"key": k})) if templated
+                    else at(f"-{k}{ext}") for k, _ in named]
+        suffix = f".{tag}" if tag else ""
+        each = shot.get("each") or []
+        if shot.backend == "web" and _named_captures(shot.raw):
+            out = []
+            for i, value in enumerate(each or [None]):
+                v = dict(m.shot_vars(shot), **({"value": value, "i": i, "n": len(each)} if each else {}))
+                steps = template_steps((shot.get("setup") or []) + (shot.get("steps") or []), v)
+                names = _named_captures({"steps": steps})
+                out += [base.parent / f"{n}{suffix}{ext}" for n in names]
+            return out
+        if each:
+            templated = any(t in (shot.get("file") or "") for t in ("{value}", "{i}"))
+            return [(lambda b: b.parent / (b.name + ext))(output_base(m, shot, tag, {"value": v, "i": i}))
+                    if templated else at(f"-{slug(v)}{ext}") for i, v in enumerate(each)]
+        return [at(ext)]
+    out = []
+    if shot.get("gif", {}) is not False:
+        out.append(at(".gif"))
+    video = video_options(shot)["formats"]
+    out += [at(f".{f}") for f in video]
+    gallery_poster = isinstance(shot.get("gallery"), dict) and shot["gallery"].get("poster")
+    poster = shot.get("poster", 0.6 if video or gallery_poster else None)
+    if poster is not None and poster is not False:
+        out.append(at("-poster.jpg"))
+    if shot.get("sheet"):
+        out.append(at("-sheet.png"))
+    return out
+
+
+def adopt(m: Manifest, only=None, tag=None, log=say) -> int:
+    """Record every selected shot whose outputs all exist as up to date for its current capture
+    and encode hashes, without shooting (a fresh checkout or worktree has no ``.darkroom``
+    state, so committed outputs would otherwise all be reshot). Returns how many were adopted."""
+    state = State(m)
+    n = 0
+    for shot in m.shots:
+        if shot.get("skip") or shot.prep or (only and shot.name not in only) or (shot.composite and tag):
             continue
         key = base_name(shot, tag)
-        # A review shoot (--out) keeps its own record, so the real outputs' entry is untouched.
         skey = key if m.out_override is None else f"{key}@{m.out_dir}"
-        cap_h, enc_h = m.capture_hash(shot, tag), m.encode_hash(shot, tag)
-        prev = state.get(skey) or {}
-        outputs_ok = bool(prev) and all((m.dir / o).exists() for o in prev.get("outputs", []))
-        reencode = False
-        if not shot.composite and not force and not encode_only:
-            take = take_capture_hash(m, key)
-            if take is None and prev.get("hash") and "capture_hash" not in prev and outputs_ok and any(
-                    prev["hash"] == m.legacy_hash(shot, tag, v) for v in LEGACY_VERSIONS):
-                # State from darkroom 0.1/0.2 for this exact shot: adopt it instead of reshooting.
-                state.put(skey, dict(prev, capture_hash=cap_h, encode_hash=enc_h, darkroom=__version__))
-                _stamp_take(m, key, cap_h)
-                log(f"= {key}: up to date (use --force to reshoot)")
-                continue
-            if take == cap_h:
-                if prev.get("encode_hash") == enc_h and outputs_ok:
-                    log(f"= {key}: up to date (use --force to reshoot)")
-                    continue
-                reencode = True
-        _mark(key)
-        log(f"> {key} ({shot.kind}{'' if shot.composite else ', ' + shot.backend})"
-            + (": capture unchanged, re-encoding the saved take" if reencode else ""))
         try:
-            if shot.kind == "pair":
-                outputs = make_pair(m, shot, log)
-            elif shot.kind == "grid":
-                outputs = make_grid(m, shot, log)
-            else:
-                if not (encode_only or reencode):
-                    capture_take(m, shot, tag, shot.get("retries", 2) if retries is None else retries, log)
-                elif not (take_dir(m, key) / "meta.json").exists():
-                    raise CaptureError(f"{key}: no saved take to re-encode; shoot it first")
-                outputs = encode_take(m, shot, tag, log)
-            state.put(skey, {"hash": m.shot_hash(shot, tag), "capture_hash": cap_h, "encode_hash": enc_h,
-                             "outputs": outputs, "tag": tag, "darkroom": __version__,
-                             "when": _dt.datetime.now().isoformat(timespec="seconds")})
-        except Exception as e:  # one failing shot doesn't stop the others
-            failed += 1
-            broken.add(shot.name)
-            log(f"! {key}: FAILED: {str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__}")
-    return failed
+            files = expected_outputs(m, shot, tag)
+            cap_h, enc_h = m.capture_hash(shot, tag), m.encode_hash(shot, tag)
+        except (KeyError, ValueError) as e:
+            log(f"! {key}: not adopted: {e}")
+            continue
+        missing = [f for f in files if not f.exists()]
+        if not files or missing:
+            log(f"- {key}: not adopted: " + (f"missing {_rel(m, missing[0])}" + (
+                f" and {len(missing) - 1} more" if len(missing) > 1 else "") if missing else "no outputs"))
+            continue
+        state.put(skey, {"hash": m.shot_hash(shot, tag), "capture_hash": cap_h, "encode_hash": enc_h,
+                         "outputs": [_rel(m, f) for f in files], "tag": tag, "darkroom": __version__,
+                         "adopted": True, "when": _dt.datetime.now().isoformat(timespec="seconds")})
+        log(f"= {key}: adopted ({len(files)} output(s))")
+        n += 1
+    log(f"adopted {n} shot(s); shoot reshoots them only when they change")
+    return n

@@ -98,7 +98,7 @@ def _collect(out_dir: Path, glob: str | None) -> list[Path]:
     return [p for p in files if p.is_file()]
 
 
-def capture(shot, device: dict, variables: dict, frames_dir: Path, log=print) -> dict:
+def capture(shot, device: dict, variables: dict, frames_dir: Path, log=print, device_for=None) -> dict:
     """Run the shot's argv once per ``each`` value (or ``repeat`` times), with {i}/{n}/{value};
     copy every image it writes into ``frames_dir`` in order. Returns {"frames", "runs",
     "captions", "logs"}: ``runs`` and ``captions`` give each frame's run index and ``each`` value."""
@@ -115,18 +115,19 @@ def capture(shot, device: dict, variables: dict, frames_dir: Path, log=print) ->
             out_dir, work_dir = Path(tmp) / "out", Path(tmp) / "work"
             out_dir.mkdir()
             work_dir.mkdir()
-            v = dict(variables)
-            v.update({"out_dir": str(out_dir), "work_dir": str(work_dir), "width": device["width"],
-                      "height": device["height"], "dpr": device.get("dpr", 1), "name": shot.name,
-                      "i": i, "n": repeat})
+            v = dict(variables, i=i, n=repeat)
             if each:
                 v["value"] = each[i]
+            # "device": "{value}": each run has its own device (and Xvfb size)
+            dev = device_for(v) if device_for else device
+            v.update({"out_dir": str(out_dir), "work_dir": str(work_dir), "width": dev["width"],
+                      "height": dev["height"], "dpr": dev.get("dpr", 1), "name": shot.name})
             xv = shot.get("xvfb")
             if xv:
                 xargs = xv.get("args", []) if isinstance(xv, dict) else []
                 xenv = xv.get("env") if isinstance(xv, dict) else None
                 xenv = XVFB_ENV if xenv is None else template(xenv, v)
-                with xvfb(device["width"], device["height"], xargs, log=log, env=xenv) as display:
+                with xvfb(dev["width"], dev["height"], xargs, log=log, env=xenv) as display:
                     v["display"] = display
                     _run(shot, v, timeout, logs, display, xenv)
             else:
