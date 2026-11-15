@@ -1,0 +1,10 @@
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.venv/
+build/
+dist/
+.darkroom/
+examples/*/media/
+examples/*/docs/media/
+node_modules/

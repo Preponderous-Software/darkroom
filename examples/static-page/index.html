@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>darkroom demo</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0e0b0b; color: #f3e6d8; font: 16px/1.4 system-ui, sans-serif; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #hud { position: fixed; left: 16px; top: 12px; font-weight: 600; letter-spacing: .04em; opacity: .85; }
+  #btn { position: fixed; right: 16px; bottom: 16px; padding: 10px 16px; border-radius: 8px; border: 0; background: #b3261e; color: #fff; font-weight: 600; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">darkroom demo &middot; <span id="count">0</span> prints</div>
+<button id="btn">Develop</button>
+<script>
+// A deterministic little scene: prints hanging on a line under a safelight, developing over
+// time. `demo.at(t)` draws the scene at t seconds, so captures are repeatable (the "hook"
+// adapter drives it with js steps). ?theme=day draws the "after" version for pair demos.
+const theme = new URLSearchParams(location.search).get("theme") || "safelight";
+const c = document.getElementById("c"), g = c.getContext("2d");
+let prints = 0;
+function size() { const d = devicePixelRatio || 1; c.width = innerWidth * d; c.height = innerHeight * d; g.setTransform(d, 0, 0, d, 0, 0); }
+function at(t) {
+  const w = innerWidth, h = innerHeight;
+  const day = theme === "day";
+  const bg = g.createRadialGradient(w * .5, -h * .2, 10, w * .5, h * .3, h * 1.2);
+  bg.addColorStop(0, day ? "#fff4dc" : "#ff4a3a"); bg.addColorStop(.35, day ? "#c9b89c" : "#5a1410"); bg.addColorStop(1, day ? "#3d3529" : "#0e0b0b");
+  g.fillStyle = bg; g.fillRect(0, 0, w, h);
+  const lineY = h * .22, n = Math.max(3, Math.min(6, Math.floor(w / 190)));
+  g.strokeStyle = day ? "#2a2520" : "#e8c9b0"; g.lineWidth = 2;
+  g.beginPath(); g.moveTo(0, lineY); g.quadraticCurveTo(w / 2, lineY + 26, w, lineY); g.stroke();
+  for (let i = 0; i < n; i++) {
+    const x = (i + .5) * w / n, sway = Math.sin(t * 1.3 + i) * 4, pw = Math.min(150, w / n * .78), ph = pw * 1.25;
+    const y = lineY + 10 + 26 * (1 - Math.pow((x - w / 2) / (w / 2), 2));
+    g.save(); g.translate(x + sway, y); g.rotate(Math.sin(t * 1.1 + i * 2) * .04);
+    g.fillStyle = "#f7f1e6"; g.fillRect(-pw / 2, 0, pw, ph);
+    const dev = Math.max(0, Math.min(1, (t - i * .45) / 2.4));   // each print develops in turn
+    const hue = [12, 200, 40, 280, 140, 330][i % 6];
+    const img = g.createLinearGradient(0, 8, 0, ph - 22);
+    img.addColorStop(0, `hsla(${hue}, 60%, ${70 - 35 * dev}%, ${dev})`); img.addColorStop(1, `hsla(${hue + 30}, 50%, ${40 - 20 * dev}%, ${dev})`);
+    g.fillStyle = img; g.fillRect(-pw / 2 + 8, 8, pw - 16, ph - 30);
+    g.fillStyle = `rgba(255,255,255,${.5 * dev})`;
+    g.beginPath(); g.arc(-pw * .15, ph * .35, pw * .12, 0, Math.PI * 2); g.fill();
+    g.fillStyle = "#222"; g.fillRect(-4, -8, 8, 14);   // the clip on the line
+    g.restore();
+  }
+  prints = Math.min(n, Math.floor(t / .45 + .2));
+  document.getElementById("count").textContent = prints;
+}
+window.demo = { at, get prints() { return prints; }, ready: true };
+addEventListener("resize", () => { size(); at(0); });
+document.getElementById("btn").addEventListener("click", () => { at(4); document.body.dataset.developed = "1"; });
+size(); at(0);
+</script>
+</body>
+</html>

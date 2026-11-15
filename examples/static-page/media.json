@@ -1,0 +1,52 @@
+{
+  "description": "darkroom's own demo: a self-contained page (no server needed) plus a command-backend shot.",
+  "out": "media",
+  "vars": { "page": "file://{manifest_dir}/index.html", "theme": "safelight" },
+  "budgets": { "still_kb": 120, "gif_mb": 1 },
+  "defaults": {
+    "backend": "web",
+    "adapter": "hook",
+    "url": "{page}?theme={theme}",
+    "ready": "window.demo && window.demo.ready",
+    "failOnConsoleError": true
+  },
+  "shots": [
+    {
+      "name": "desktop", "kind": "still", "device": "desktop",
+      "caption": "The demo page at 1280x720, all six prints developed.",
+      "alt": "Six photographic prints hanging on a line under a red safelight",
+      "steps": [ { "js": "demo.at(5)" } ]
+    },
+    {
+      "name": "phone", "kind": "still", "device": "phone", "width": 390,
+      "caption": "The same page on a 390x844 touch phone at DPR 3, after tapping Develop.",
+      "alt": "Three prints on a phone screen, a red Develop button at the bottom right",
+      "steps": [ { "tap": [330, 812] }, { "waitFor": "document.body.dataset.developed === '1'", "timeout": 5000 } ]
+    },
+    {
+      "name": "developing", "kind": "clip", "device": { "width": 640, "height": 360 },
+      "caption": "Prints developing one after another (36 frames, stepped by a JS hook).",
+      "alt": "Animation: blank prints fill in with colour one at a time",
+      "fps": 12,
+      "gif": { "width": 480, "palette": "adaptive" },
+      "video": ["mp4", "webm"],
+      "sheet": true,
+      "steps": [
+        { "css": "#btn { display: none }" },
+        { "repeat": 36, "steps": [ { "js": "demo.at(i / 12)" }, { "capture": true } ] }
+      ]
+    },
+    {
+      "name": "card", "kind": "still", "backend": "command", "device": { "width": 640, "height": 360 },
+      "caption": "The command backend: any program that writes PNGs into {out_dir}.",
+      "alt": "Concentric red rings on black with a size label",
+      "argv": ["python3", "render_card.py", "{out_dir}", "{width}", "{height}", "darkroom"]
+    },
+    {
+      "name": "theme-pair", "kind": "pair", "of": "desktop", "width": 960,
+      "labels": ["before: safelight", "after: daylight"],
+      "caption": "A before/after pair: darkroom shoot media.json --only desktop --tag before, then --var theme=day --tag after.",
+      "alt": "Side by side: the scene under red safelight and under daylight"
+    }
+  ]
+}

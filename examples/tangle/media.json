@@ -1,0 +1,106 @@
+{
+  "description": "Tangle's README stills and GIFs (a port of its tools/media.cjs). Put this file at the game's root, serve the game, then: darkroom shoot media.json",
+  "out": "docs/media",
+  "vars": { "base": "http://127.0.0.1:8781/", "start": "new=1" },
+  "devices": { "wide": { "width": 960, "height": 540 } },
+  "budgets": { "still_kb": 200, "gif_mb": 3 },
+  "defaults": {
+    "backend": "web",
+    "adapter": "strata-kit",
+    "device": "desktop",
+    "url": "{base}?drive=1&{start}",
+    "waitUntil": "commit",
+    "ready": "window.__tangle && window.__strataKit",
+    "css": "#objective, #caption { display: none !important; }",
+    "quality": 86,
+    "setup": [
+      { "js": "window.__dr = { EYE: 1.62, TRI: [-19.6, 2.9, -3.6], look(from, at) { const dx = at[0] - from[0], dz = at[2] - from[1], dy = at[1] - this.EYE, h = Math.hypot(dx, dz); return [Math.atan2(-dz, -dx), Math.atan2(-dy, h)]; }, pose(x, z, yaw, pitch) { const g = window.__tangle; if (g.state.card) g.card(null); g.pose(x, z, yaw, pitch); } }" }
+    ]
+  },
+  "shots": [
+    {
+      "name": "hall", "kind": "still",
+      "caption": "The hall of a fresh house.",
+      "alt": "A first-person view down a lit hall with doorways on both sides",
+      "steps": [ { "js": "__dr.pose(0, 4.0, Math.PI / 2, 0.06)" }, { "frames": 6 } ]
+    },
+    {
+      "name": "triangle-broken", "kind": "still",
+      "caption": "The impossible triangle, seen from the wrong place.",
+      "alt": "Three beams that fail to meet, seen from the side",
+      "steps": [ { "js": "const [y, p] = __dr.look([-14.6, 4.6], __dr.TRI); __dr.pose(-14.6, 4.6, y, p)" }, { "frames": 6 } ]
+    },
+    {
+      "name": "machine-console", "kind": "still",
+      "caption": "The MIU machine's console after a few rules.",
+      "alt": "A console showing a string of M, I and U letters and rule buttons",
+      "steps": [
+        { "js": "__dr.pose(16, -2.4, Math.PI / 2, 0.28); for (const b of ['r2', 'r2', 'r1', 'next']) __tangle.press(b)" },
+        { "frames": 6 }
+      ]
+    },
+    {
+      "name": "screen-inside-itself", "kind": "still",
+      "caption": "A screen showing itself.",
+      "alt": "A screen whose picture contains smaller and smaller copies of itself",
+      "steps": [ { "js": "__dr.pose(0, 19.6, -Math.PI / 2, -0.05)" }, { "frames": 60 } ]
+    },
+    {
+      "name": "stairwell", "kind": "still",
+      "caption": "The stairwell that never ends.",
+      "alt": "Looking down a stairwell that loops back on itself",
+      "steps": [ { "js": "__dr.pose(-13.0, 11.0, Math.atan2(-5.0, 4.0), 0.55)" }, { "frames": 6 } ]
+    },
+    {
+      "name": "triangle-closes", "kind": "clip", "device": "wide",
+      "caption": "Walk to the one viewpoint and the triangle closes.",
+      "alt": "Animation: the camera walks sideways until three beams line up into an impossible triangle",
+      "fps": 12.5,
+      "gif": { "width": 640, "colors": 160, "palette": "octree" },
+      "video": ["mp4"],
+      "steps": [
+        { "repeat": 36, "steps": [
+          { "js": "const a = [-16.8, 0.6], b = [-12.2, 5.4], s = u * u * (3 - 2 * u), x = a[0] + (b[0] - a[0]) * s, z = a[1] + (b[1] - a[1]) * s; const [y, p] = __dr.look([x, z], __dr.TRI); __dr.pose(x, z, y, p)" },
+          { "frames": 2 }, { "capture": true }
+        ] },
+        { "repeat": 14, "steps": [ { "frames": 4 }, { "capture": true } ] }
+      ]
+    },
+    {
+      "name": "screen-feedback", "kind": "clip", "device": "wide",
+      "caption": "Walking up to the screen: it fills with copies of itself.",
+      "alt": "Animation: approaching a screen that shows ever deeper copies of itself",
+      "fps": 12.5,
+      "gif": { "width": 640, "colors": 160 },
+      "setup": [
+        { "js": "window.__dr = { pose(x, z, yaw, pitch) { const g = window.__tangle; if (g.state.card) g.card(null); g.pose(x, z, yaw, pitch); } }" },
+        { "js": "__dr.pose(0, 12.5, -Math.PI / 2, -0.03)" }, { "frames": 30 }
+      ],
+      "steps": [
+        { "repeat": 44, "steps": [
+          { "js": "const v = Math.min(1, i / 36), s = v * v * (3 - 2 * v); __dr.pose(Math.sin(i / 9) * 0.25 * (1 - s), 12.5 + (19.9 - 12.5) * s, -Math.PI / 2 + Math.sin(i / 7) * 0.03, -0.04)" },
+          { "frames": 4 }, { "capture": true }
+        ] }
+      ]
+    },
+    {
+      "name": "library", "kind": "still", "device": "wide",
+      "url": "{base}?drive=1&skip=4",
+      "caption": "The library, once rooms one to four are solved.",
+      "alt": "Shelves of numbered books under warm light",
+      "steps": [ { "js": "__dr.pose(-3.2, 26.2, -Math.PI / 2 - 0.62, 0.08)" }, { "frames": 6 } ]
+    },
+    {
+      "name": "prover-room", "kind": "still", "device": "wide",
+      "url": "{base}?drive=1&skip=5",
+      "caption": "The Prover's room.",
+      "alt": "A room with a large machine and a desk",
+      "steps": [ { "js": "__dr.pose(-17.2, 33.4, -0.38, 0.02)" }, { "frames": 6 } ]
+    },
+    {
+      "name": "hall-dawn-dusk", "kind": "pair",
+      "of": "hall", "labels": ["before", "after"],
+      "caption": "The hall before and after a change (shoot hall with --tag before, then --tag after)."
+    }
+  ]
+}

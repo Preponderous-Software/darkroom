@@ -1,0 +1,50 @@
+{
+  "description": "Command-backend recipes. Each shot wraps a program that writes images into {out_dir}. Paths and flags are placeholders: adapt them to your project.",
+  "out": "docs/screenshots",
+  "vars": {
+    "game": "./build/MyGame",
+    "golden": "./build/strata-golden",
+    "scene": "scenes/title.json",
+    "rig": "./tools/render-still.sh",
+    "jar": "./build/libs/plugin.jar"
+  },
+  "devices": {
+    "tablet": { "width": 1024, "height": 768 },
+    "tall-phone": { "width": 412, "height": 915 }
+  },
+  "shots": [
+    {
+      "name": "title-desktop", "kind": "still", "backend": "command", "device": "desktop",
+      "comment": "A native desktop game with its own screenshot flags, on a private Xvfb display.",
+      "argv": ["{game}", "--start-screen", "title", "--size", "{width}x{height}", "--screenshot-after-frames", "30", "--screenshot-dir", "{out_dir}"],
+      "xvfb": true, "timeout": 180,
+      "caption": "The title screen at 1280x720.", "alt": "The game's title screen"
+    },
+    {
+      "name": "title-tablet", "kind": "still", "backend": "command", "device": "tablet",
+      "argv": ["{game}", "--start-screen", "title", "--size", "{width}x{height}", "--screenshot-after-frames", "30", "--screenshot-dir", "{out_dir}"],
+      "xvfb": true,
+      "caption": "The title screen at 1024x768.", "alt": "The game's title screen, 4:3"
+    },
+    {
+      "name": "title-compare", "kind": "pair", "of": "title-desktop",
+      "comment": "Two builds, same shot: darkroom shoot media.json --only title-desktop --tag before --var game=./old/MyGame, then --tag after.",
+      "caption": "Title screen, previous build vs this one."
+    },
+    {
+      "name": "strata-scene", "kind": "still", "backend": "command", "device": "desktop",
+      "comment": "An engine's own headless renderer (no browser): render one scene to a PNG.",
+      "argv": ["{golden}", "render", "{scene}", "--size", "{width}", "{height}", "--out", "{out_dir}/scene.png"],
+      "caption": "A Strata scene rendered headless.", "alt": "A rendered 3D scene"
+    },
+    {
+      "name": "territory", "kind": "clip", "backend": "command", "device": { "width": 960, "height": 540 },
+      "comment": "A RAM-heavy rig (throwaway server + bot + render): one at a time machine-wide via the lock; repeat runs it per camera step.",
+      "argv": ["{rig}", "{jar}", "{out_dir}/still.jpg"],
+      "env": { "CAMERA_STEP": "{i}", "CAMERA_STEPS": "{n}", "SIZE": "{width} {height}" },
+      "repeat": 6, "lock": "minecraft-rig", "timeout": 1800, "retries": 1,
+      "gif": { "fps": 2, "palette": "adaptive" },
+      "caption": "Claimed territory, orbiting the camera.", "alt": "Animation: the claimed chunks seen from six angles"
+    }
+  ]
+}
