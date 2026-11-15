@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (0.6)
+## 0.6.0 (2026-11-15) (0.6)
 
 0.5 manifests keep working, and the capture and encode hashes of unchanged shots are the same,
 so nothing is reshot on upgrade.
