@@ -4,6 +4,9 @@
 
 First version.
 
+- `xvfb: true` runs Xvfb and the program with software OpenGL (llvmpipe), so GLX keeps working where a
+  host GPU driver would crash Xvfb (e.g. NVIDIA under WSL); `xvfb.env` overrides it.
+
 - `darkroom shoot | check | gallery | pair | sheet` over a JSON shot list (`media.json`).
 - Shot kinds: `still`, `clip`, `pair` (before/after, from two tagged runs or two image paths).
 - Backends: `web` (Playwright in a bundled Node runner; adapters `strata-kit` and `hook`) and
