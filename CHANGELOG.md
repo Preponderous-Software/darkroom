@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.3.0 (unreleased)
+
+From a second pilot: a Strata web-kit game shot in software WebGL on a heavily loaded machine.
+0.2 manifests keep working unchanged.
+
+### Changed
+
+- **GIFs are much smaller again, and still decode everywhere.** darkroom now writes GIFs with its
+  own inter-frame optimization: each frame after the first marks pixels unchanged from the
+  frame before with a reserved transparent palette index and is cropped to the box around
+  its changes (or stored as a plain crop when that is smaller), with disposal 1 and a complete
+  colour table (one global 256-entry table for `adaptive`, a full table per frame for
+  `octree`/`median`). Identical frames merge into one longer frame. 0.2 had dropped Pillow's
+  optimizer (it wrote indices past trimmed palettes, which ImageMagick rejects); on a mostly
+  static 47-frame clip the GIF goes from 406 KB to 120 KB, and no clip gets bigger.
+- **Resume survives upgrades and harmless edits.** The single shot hash is split into a
+  *capture* hash (url or argv, steps, device, adapter and the other fields that change the
+  pixels, plus the vars) and an *encode* hash (formats, budgets, palettes, sizes, `file`, ...).
+  A changed capture hash reshoots; a changed encode hash only re-encodes the saved take.
+  Neither includes the darkroom version, `retries`, `lock`, `timeout`, `comment`, `caption`,
+  `alt` or gallery options, so none of those mark a shot stale any more (#2). State written by
+  0.1/0.2 is recognised and adopted when the shot has not changed.
+- **`waitFor` steps wait.** They returned at once whatever the expression said, because
+  Playwright treated the async predicate's Promise as truthy (#4). They now poll in the page
+  and fail the attempt on timeout.
+- **One timeout for every Playwright call.** Screenshots, clicks, taps and navigation use
+  `screenshotTimeout` (ms), else the shot's `timeout`, else 120 s, instead of Playwright's
+  30 s default that every attempt missed on a loaded machine (#5).
+- `gallery --insert` ignores markers inside inline code and fenced code blocks (#1).
+- `--only` can be repeated: `--only a --only b` shoots both (#8).
+
+### Added
+
+- Steps: `{"until": "expr", "steps": [...], "max": N, "then": M}` repeats steps until the
+  expression holds (at most `max` passes), then runs `then` more passes (#7);
+  `{"goto": "url"}` and `{"reload": true}`, each followed by the ready wait and the shot's
+  `css`; `{"tap": "css selector"}` taps an element's centre (touchscreen on touch devices);
+  `{"frames": 3, "step": 0.1}`.
+- `frameStep`: `strata-kit` seconds per driven frame (default 1/30).
+- Named stills: `{"capture": "name"}` in a still writes `name.jpg` per capture, so one browser
+  session makes several stills without replaying.
+- `gif.hold_last_ms` and `video: {"formats": [...], "hold_last": seconds}` hold the last frame
+  (#7).
+- `every`: keep every Nth captured frame of a clip; `gif.every` and `video.every` override it.
+- `colors` on PNG stills, pairs and grids: quantize to at most N colours.
+- `gallery: {"width": 480, "poster": true}` per shot: `<img width=...>` in the gallery, and a
+  clip's poster beside its GIF (#3).
+- `darkroom shoot --out DIR` writes every output (including `file` ones) into a scratch dir
+  for review, with its own state record; the takes are shared.
+- Each take's `meta.json` and each state entry record the darkroom version that made it. The
+  README shows how to pin a version on shared machines.
+
 ## 0.2.0 (2026-11-15)
 
 From the first pilot: a native desktop game captured through the `command` backend under Xvfb.

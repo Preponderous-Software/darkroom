@@ -37,6 +37,17 @@ pip install "darkroom[video] @ git+https://github.com/Preponderous-Software/dark
   `$NODE_PATH`, then `$DARKROOM_PLAYWRIGHT`.
 - The `command` backend's `xvfb: true` needs `Xvfb` (`apt install xvfb`).
 
+**Pin a version on shared machines.** Several projects on one machine can share one darkroom;
+pin the tag so an upgrade there doesn't change your outputs under you:
+
+```sh
+pip install "darkroom[video] @ git+https://github.com/Preponderous-Software/darkroom@v0.3.0"
+```
+
+Each take's `meta.json` and each entry in `.darkroom/state.json` record the darkroom version
+that made it (`"darkroom": "0.3.0"`). Upgrading does not by itself mark shots stale (see
+[Takes, resume and re-encoding](#takes-resume-and-re-encoding)).
+
 ## Quickstart
 
 ```json
@@ -64,6 +75,7 @@ pip install "darkroom[video] @ git+https://github.com/Preponderous-Software/dark
 darkroom check media.json                       # validate, with the exact place of each problem
 darkroom shoot media.json                       # shoot everything that isn't up to date
 darkroom shoot media.json --only walk --force   # reshoot one
+darkroom shoot media.json --out /tmp/review     # every output into a scratch dir, for review
 darkroom gallery media.json --relative-to README.md   # print markdown for the outputs
 darkroom gallery media.json --insert README.md        # update the images in a doc in place
 ```
@@ -126,20 +138,23 @@ Every shot:
 | Key | Meaning |
 |---|---|
 | `name` | Unique; becomes the file name (`name.jpg`, `name.gif`, ...). |
-| `kind` | `still` (one image), `clip` (frames from `capture` steps), `pair` (before/after) or `grid` (a captioned composite of other shots). |
+| `kind` | `still` (one image, or one per named `capture`), `clip` (frames from `capture` steps), `pair` (before/after) or `grid` (a captioned composite of other shots). |
 | `backend` | `web` (default) or `command`. |
 | `device` | `desktop` (1280x720), `hd` (1920x1080), `phone` (390x844, DPR 3, touch, mobile), `landscape-phone` (844x390), a custom name, or an inline `{ "width", "height", ... }`. |
 | `caption`, `alt` | Used by the gallery. Say so in `alt` if `speed` > 1. |
 | `format`, `quality`, `width` | Stills: `jpg` (default) or `png`, starting JPEG quality (86), maximum width. |
+| `colors` | PNG stills, pairs and grids: quantize to at most this many colours (2 to 256). Budget fitting can still go lower. |
 | `file` | Write the output to this path (relative to the manifest) instead of `<out>/<name>.<ext>`, so a shot can replace an existing image in place. The extension picks the format: `.jpg`/`.png` for stills, pairs and grids; `.gif`, `.mp4` or `.webm` for a clip (its other outputs share the name: `walk.gif`, `walk.mp4`, `walk-poster.jpg`). A tag goes before the extension (`seasons.before.png`). Vars, `{name}`, and with `each` `{value}`/`{i}`, are filled in. |
 | `each` | `web` and `command`: a list of values, one run each (a fresh browser or process), with `{value}`, `{i}` and `{n}` set (also in the page's `vars`). Implies `repeat` = its length. A still makes one image per value (`name-<value>.jpg`, or the `file` template); a clip plays the runs in order. |
 | `aspect` | Centre-crop every frame to a ratio such as `"16:9"` or `"1:1"`. |
 | `fps`, `speed` | Clip playback rate (12) and a speed-up factor. |
-| `gif` | `{ fps, width (640), palette, colors (256), dither (false), loop (0), budget_mb }`, or `false` for no GIF. Palettes: `adaptive` (the default: one octree palette for the whole clip, so no colour flicker, and the smallest files), `octree` (a palette per frame; keeps small saturated details), `median` (per frame, median cut). GIFs are written without Pillow's optimizer, which can leave colour indices past a frame's trimmed palette (strict decoders reject those files); budget fitting makes up the size. |
-| `video` | `["mp4"]`, `["webm"]` or both. |
+| `every` | Clips: keep every Nth captured frame (2 halves a long take). `gif.every` and `video.every` override it for one output. Playback `fps` is unchanged, so the clip gets shorter. |
+| `gif` | `{ fps, width (640), palette, colors (256), dither (false), loop (0), budget_mb, hold_last_ms, every }`, or `false` for no GIF. Palettes: `adaptive` (the default: one octree palette for the whole clip, so no colour flicker, and the smallest files), `octree` (a palette per frame; keeps small saturated details), `median` (per frame, median cut). `hold_last_ms` shows the last frame that long before the loop restarts. See [GIF size](#gif-size) for how frames are stored. |
+| `video` | `["mp4"]`, `["webm"]` or both; or `{ "formats": ["mp4"], "every": 2, "hold_last": 1.5 }`, where `hold_last` holds the last frame that many extra seconds. |
 | `poster` | Frame for a poster JPEG: an index, or a fraction of the clip (default 0.6 when there is video). |
 | `sheet` | `true` also publishes the contact sheet as `<name>-sheet.png` (one is always kept with the take for review); or `{ "labels": "none" \| "index" \| "caption", "cols": 4, "width": 1600 }`. `index` (default) labels tiles `#3`; `caption` uses each frame's `each` value. |
 | `retries`, `timeout`, `lock` | Attempts after the first (2), seconds per attempt, a lock name. |
+| `gallery` | How the gallery shows the shot: `{ "width": 480 }` writes `<img ... width="480">`; `"poster": true` shows a clip's poster beside its GIF (and makes the poster). Changing it never reshoots. |
 | `skip` | Leave the shot out of `shoot`. |
 
 ### The web backend
@@ -147,7 +162,9 @@ Every shot:
 | Key | Meaning |
 |---|---|
 | `url` | The page (templated). `file://{manifest_dir}/index.html` works for static pages. |
-| `adapter` | `hook` (default; any page, waits are wall-clock) or `strata-kit` (waits for `window.__strataKit`; `frames` drives its clock by exactly 1/30 s per frame; `camera` sets `__strataKit.cam`). |
+| `adapter` | `hook` (default; any page, waits are wall-clock) or `strata-kit` (waits for `window.__strataKit`; `frames` drives its clock by exactly `frameStep` seconds per frame; `camera` sets `__strataKit.cam`). |
+| `frameStep` | `strata-kit`: game seconds per driven frame (default `1/30`). A `frames` step can set its own `step`. |
+| `screenshotTimeout` | Milliseconds for every Playwright call that can time out: screenshots, clicks, taps, navigation. Default: the shot's `timeout`, else 120000. (Playwright's own 30 s default fails every attempt on a heavily loaded machine rendering WebGL in software.) |
 | `ready` | A JS expression to wait for before the steps (default `window.__strataKit` or `true`). |
 | `readyTimeout`, `waitUntil` | Milliseconds to wait for the page (120000) and the navigation event (`load`, `domcontentloaded`, `commit`). |
 | `css` | Styles injected once the page is ready (hide the HUD). |
@@ -164,14 +181,17 @@ Steps (one verb per object):
 | `{"js": "expr or statements"}` | Runs in the page. Sees `vars`, and inside a `repeat`: `i`, `n` and `u` (`i / (n - 1)`, for easing). |
 | `{"key": "KeyW", "action": "down"}` | `down`, `up` or `press` (default). |
 | `{"type": "hello"}` | Types text. |
-| `{"tap": [x, y]}` | A touch tap on touch devices, a click otherwise. |
+| `{"tap": [x, y]}` / `{"tap": "css selector"}` | A touch tap (on touch devices; a click otherwise), at a point or at the centre of the first matching element. |
 | `{"click": "css selector"}` | Clicks an element. |
 | `{"wait": 250}` | Waits, in wall-clock milliseconds. |
-| `{"waitFor": "js expr", "timeout": 30000}` | Waits until the expression is truthy: game state, not guesswork. |
-| `{"frames": 6}` | `strata-kit`: drives 6 frames of game time. `hook`: waits 6 animation frames. |
+| `{"waitFor": "js expr", "timeout": 30000}` | Waits until the expression is truthy: game state, not guesswork. Fails the attempt if it never is. |
+| `{"frames": 6}` / `{"frames": 3, "step": 0.1}` | `strata-kit`: drives 6 frames of game time (`step` seconds each; default `frameStep`). `hook`: waits 6 animation frames. |
 | `{"camera": {"yaw": 0.5, "dist": 8}}` | `strata-kit` only: sets any of `yaw`, `pitch`, `dist`, `tx`, `ty`, `tz`. |
 | `{"css": "..."}` | Injects styles at this point. |
 | `{"capture": true}` | Adds a frame to a clip. |
+| `{"capture": "name"}` | In a still: writes `name.jpg` (or `.png`) beside the shot's outputs. Several in one shot make several stills from one browser session, with no replays. Names are unique per shot. |
+| `{"goto": "url"}` / `{"reload": true}` | Navigates (relative to the current page; vars are filled in) or reloads, then waits for `ready` and re-applies `css`, as at the start. The `strata-kit` clock starts again. |
+| `{"until": "js expr", "steps": [...], "max": 40, "then": 2}` | Runs the steps, then checks the expression, until it is truthy or `max` passes have run (a warning, not a failure), then `then` more passes. Inside: `i`, `n` (= `max`), `u`. |
 | `{"mark": "in"}` / `{"mark": "out"}` | Trims the clip to the frames between the marks. |
 | `{"repeat": 36, "var": "i", "steps": [...]}` | Runs the inner steps `n` times. |
 
@@ -258,10 +278,25 @@ paths: `"before": "a.png", "after": "b.png"`.
 ## Takes, resume and re-encoding
 
 Each shot's raw frames are kept as a take in `.darkroom/takes/<name>/` next to the manifest,
-with a `meta.json` (device, frames, console errors, attempt, time) and a contact sheet.
-`.darkroom/state.json` remembers a hash of each shot (its fields, the vars, the budgets) and
-its outputs; `darkroom shoot` skips a shot whose hash and outputs are unchanged. Add
-`.darkroom/` to your `.gitignore`.
+with a `meta.json` (device, frames, console errors, attempt, time, darkroom version, capture
+hash) and a contact sheet. Add `.darkroom/` to your `.gitignore`.
+
+`darkroom shoot` keeps two hashes per shot:
+
+- the **capture hash**: only what changes the pixels captured (the url or argv, steps, setup,
+  device, adapter, ready, css, crop, the vars, and so on). When it changes, the shot is reshot.
+- the **encode hash**: what changes the files made from a take (format, quality, width, `gif`,
+  `video`, `poster`, `sheet`, `aspect`, `speed`, `fps`, `every`, `colors`, `file`, budgets).
+  When only this changes, the saved take is re-encoded without reshooting.
+
+Neither includes the darkroom version, `retries`, `lock`, `timeout`, `screenshotTimeout`,
+`comment`, `caption`, `alt` or `gallery` width, so changing those (or upgrading) never marks a
+shot stale. State written by darkroom 0.1 or 0.2 is recognised and adopted on the first 0.3 run
+when the shot has not changed.
+
+`--out DIR` writes every output into `DIR`, including shots with a `file`, and keeps its own
+record in the state, so a review shoot never touches the real outputs. The takes are shared,
+so a later normal `shoot` re-encodes from them instead of reshooting.
 
 ```sh
 darkroom shoot media.json --encode --only walk   # re-encode the last take (new budget, palette, aspect) without reshooting
@@ -277,6 +312,19 @@ frames spread evenly across the take, labelled with the frame index (`--labels i
 sheet goes into its out dir, a take folder's into its manifest's out dir, and a plain
 folder's beside the folder (`<folder>-sheet.png`); nothing is written into a take. For a
 README composite use a [grid](#grids) instead.
+
+### GIF size
+
+darkroom writes GIFs itself (with Pillow's LZW encoder for each frame's pixels) instead of using
+Pillow's optimizer, whose trimmed per-frame palettes can leave colour indices past the end of
+the table (ImageMagick rejects those files: "invalid colormap index"). Every frame after the
+first keeps only what changed: pixels that are the same as in the frame before become a
+reserved transparent index, and the frame is cropped to the box around the changes (or stored
+as a plain crop, when that is smaller). Frames are not disposed, so each paints over the
+last, and every frame's colour table is complete: one global 256-entry table for `adaptive`,
+or a full table per frame for `octree` and `median`. Identical frames are merged into one
+longer frame. A mostly static clip (a HUD, a small character moving on a still scene) shrinks
+several times over; a clip where the whole frame moves gains a little.
 
 ## Locks
 
@@ -320,6 +368,12 @@ A marker naming an unknown shot is an error; a shot with nothing shot yet is lef
 Each shot becomes its image (a GIF before a still; a video becomes a poster linked to the
 MP4; a still with `each`, one image per value), its caption in italics, and a link to the
 MP4 when a clip has both.
+
+Markers inside inline code (`` `<!-- darkroom:shot NAME /-->` ``) or fenced code blocks are
+documentation and are left alone, so a README can show how to write them.
+
+A shot's `gallery` options change how it is shown: `"width": 480` writes an `<img>` tag with
+that width instead of `![...](...)`, and `"poster": true` puts a clip's poster beside its GIF.
 
 **Links.** The project root is the git work tree holding the manifest (or the manifest's
 folder outside git). When the document is inside it, links are relative to the document.
