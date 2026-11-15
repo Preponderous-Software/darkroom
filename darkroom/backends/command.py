@@ -142,12 +142,25 @@ def capture(shot, device: dict, variables: dict, frames_dir: Path, log=print) ->
     return {"frames": frames, "runs": runs, "captions": captions, "logs": logs, "consoleErrors": []}
 
 
+def anchor_paths(argv: list[str], manifest_dir: str) -> list[str]:
+    """The default cwd is the run's scratch dir, so relative paths that meant the manifest's
+    directory (when it was the cwd, in 0.1) are made absolute: the program if it has a slash
+    (``./build/Game``), and any other entry that names an existing file next to the manifest
+    (``render.py``), or an existing path when it has a slash (``scenes/title.json``)."""
+    out = []
+    for k, a in enumerate(argv):
+        if a and not os.path.isabs(a) and not a.startswith("-"):
+            cand = os.path.normpath(os.path.join(manifest_dir, a))
+            if ("/" in a and (k == 0 or os.path.exists(cand))) or (k > 0 and os.path.isfile(cand)):
+                a = cand
+        out.append(a)
+    return out
+
+
 def _run(shot, v, timeout, logs, display, gl_env=None):
     argv = expand_argv(shot["argv"], v)
-    # The default cwd is the run's scratch dir, so a relative program path ("./build/Game")
-    # still means the manifest's, as it did when the manifest dir was the default cwd.
-    if os.sep in argv[0] and not os.path.isabs(argv[0]) and shot.get("cwd") is None:
-        argv[0] = os.path.normpath(os.path.join(v.get("manifest_dir", "."), argv[0]))
+    if shot.get("cwd") is None:
+        argv = anchor_paths(argv, v.get("manifest_dir", "."))
     env = dict(os.environ)
     env.update(gl_env or {})  # the same GL as the display's (the shot's own env still wins)
     env.update(template(shot.get("env", {}), v))

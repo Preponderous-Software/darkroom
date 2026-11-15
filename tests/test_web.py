@@ -55,3 +55,15 @@ def test_strata_kit_clip(server, write_manifest):
     assert len(meta["frames"]) == 4
     with Image.open(p.parent / "media/slide.gif") as g:
         assert g.n_frames == 4
+
+
+@pytest.mark.skipif(not playwright_available(), reason="Node Playwright not resolvable (set NODE_PATH)")
+def test_each_runs_a_fresh_page_per_value(server, write_manifest):
+    p = write_manifest({"vars": {"base": server}, "shots": [{
+        "name": "view", "kind": "still", "adapter": "strata-kit", "url": "{base}index.html?v={value}",
+        "device": {"width": 320, "height": 180}, "retries": 0, "each": ["a", "b"],
+        "steps": [{"waitFor": "location.search === '?v=' + vars.value && vars.n === 2"}]}]})
+    assert shoot(load(p)) == 0
+    assert (p.parent / "media/view-a.jpg").exists() and (p.parent / "media/view-b.jpg").exists()
+    meta = json.loads((p.parent / ".darkroom/takes/view/meta.json").read_text())
+    assert meta["runs"] == [0, 1] and meta["captions"] == ["a", "b"]

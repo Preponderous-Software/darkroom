@@ -1,28 +1,34 @@
 {
-  "description": "Command-backend recipes. Each shot wraps a program that writes images into {out_dir}. Paths and flags are placeholders: adapt them to your project.",
+  "description": "Command-backend recipes. Each shot wraps a program that writes images into {out_dir}; it runs in a scratch {work_dir}, so relative paths other than the program itself are written as {manifest_dir}/... Paths and flags are placeholders: adapt them to your project.",
   "out": "docs/screenshots",
   "vars": {
     "game": "./build/MyGame",
+    "common": ["--fast", "--seed", "7", "--no-audio"],
     "golden": "./build/strata-golden",
-    "scene": "scenes/title.json",
+    "scene": "{manifest_dir}/scenes/title.json",
     "rig": "./tools/render-still.sh",
-    "jar": "./build/libs/plugin.jar"
+    "jar": "{manifest_dir}/build/libs/plugin.jar"
   },
   "devices": {
     "tablet": { "width": 1024, "height": 768 },
     "tall-phone": { "width": 412, "height": 915 }
   },
+  "defaults": {
+    "backend": "command",
+    "comment": "Every game shot starts from this argv; @common splices the shared flags, and a shot's argv+ appends its own.",
+    "argv": ["{game}", "@common", "--size", "{width}x{height}", "--screenshot-after-frames", "30", "--screenshot-dir", "{out_dir}"]
+  },
   "shots": [
     {
-      "name": "title-desktop", "kind": "still", "backend": "command", "device": "desktop",
+      "name": "title-desktop", "kind": "still", "device": "desktop",
       "comment": "A native desktop game with its own screenshot flags, on a private Xvfb display.",
-      "argv": ["{game}", "--start-screen", "title", "--size", "{width}x{height}", "--screenshot-after-frames", "30", "--screenshot-dir", "{out_dir}"],
+      "argv+": ["--start-screen", "title"],
       "xvfb": true, "timeout": 180,
       "caption": "The title screen at 1280x720.", "alt": "The game's title screen"
     },
     {
-      "name": "title-tablet", "kind": "still", "backend": "command", "device": "tablet",
-      "argv": ["{game}", "--start-screen", "title", "--size", "{width}x{height}", "--screenshot-after-frames", "30", "--screenshot-dir", "{out_dir}"],
+      "name": "title-tablet", "kind": "still", "device": "tablet",
+      "argv+": ["--start-screen", "title"],
       "xvfb": true,
       "caption": "The title screen at 1024x768.", "alt": "The game's title screen, 4:3"
     },
@@ -32,13 +38,27 @@
       "caption": "Title screen, previous build vs this one."
     },
     {
-      "name": "strata-scene", "kind": "still", "backend": "command", "device": "desktop",
+      "name": "season", "kind": "still", "device": "desktop",
+      "comment": "One run per value: writes season-spring.jpg ... season-winter.jpg.",
+      "argv+": ["--start-screen", "world", "--season", "{value}"],
+      "each": ["spring", "summer", "autumn", "winter"], "xvfb": true,
+      "caption": "The world in each season."
+    },
+    {
+      "name": "seasons", "kind": "grid", "of": "season",
+      "comment": "A README composite, replacing an existing image in place.",
+      "title": "The four seasons", "captions": ["Spring", "Summer", "Autumn", "Winter"],
+      "file": "docs/images/seasons.png",
+      "caption": "The same field through the year.", "alt": "Four views of one field: spring, summer, autumn and winter"
+    },
+    {
+      "name": "strata-scene", "kind": "still", "device": "desktop",
       "comment": "An engine's own headless renderer (no browser): render one scene to a PNG.",
       "argv": ["{golden}", "render", "{scene}", "--size", "{width}", "{height}", "--out", "{out_dir}/scene.png"],
       "caption": "A Strata scene rendered headless.", "alt": "A rendered 3D scene"
     },
     {
-      "name": "territory", "kind": "clip", "backend": "command", "device": { "width": 960, "height": 540 },
+      "name": "territory", "kind": "clip", "device": { "width": 960, "height": 540 },
       "comment": "A RAM-heavy rig (throwaway server + bot + render): one at a time machine-wide via the lock; repeat runs it per camera step.",
       "argv": ["{rig}", "{jar}", "{out_dir}/still.jpg"],
       "env": { "CAMERA_STEP": "{i}", "CAMERA_STEPS": "{n}", "SIZE": "{width} {height}" },

@@ -45,6 +45,24 @@ def test_relative_program_still_means_the_manifests(write_manifest, fake_cmd):
     assert (p.parent / "media/a.jpg").exists()
 
 
+def test_relative_script_argument_still_means_the_manifests(write_manifest, fake_cmd):
+    script = write_manifest({}, "render.py")
+    script.write_text(open(fake_cmd[1]).read())
+    p = write_manifest({"shots": [{"name": "a", "backend": "command",
+                                   "argv": [sys.executable, "render.py", "{out_dir}", "16", "16", "--color", "1,2,3"]}]})
+    assert shoot(load(p), log=quiet) == 0
+    assert (p.parent / "media/a.jpg").exists()
+
+
+def test_anchor_paths(tmp_path):
+    from darkroom.backends.command import anchor_paths
+    (tmp_path / "scenes").mkdir()
+    (tmp_path / "scenes/t.json").write_text("{}")
+    (tmp_path / "title").mkdir()  # a directory named like a plain word is left alone
+    got = anchor_paths(["./bin/game", "scenes/t.json", "title", "--x", "missing/a", "/abs"], str(tmp_path))
+    assert got == [str(tmp_path / "bin/game"), str(tmp_path / "scenes/t.json"), "title", "--x", "missing/a", "/abs"]
+
+
 def test_each_runs_once_per_value(write_manifest, fake_cmd):
     p = write_manifest({"shots": [
         {"name": "season", "backend": "command", "device": {"width": 64, "height": 48},

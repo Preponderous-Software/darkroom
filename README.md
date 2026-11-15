@@ -2,8 +2,8 @@
 
 A small media-capture kit for project READMEs, release notes and pull requests. You write a
 JSON shot list (`media.json`); darkroom drives a browser or runs your program, then makes
-budget-fitted stills, GIFs, MP4/WebM clips, contact sheets, before/after pairs and a markdown
-gallery you can paste anywhere.
+budget-fitted stills, GIFs, MP4/WebM clips, contact sheets, before/after pairs, captioned
+grids and a markdown gallery you can paste anywhere.
 
 ![Six photographic prints hanging on a line under a red safelight](docs/img/desktop.jpg)
 
@@ -65,6 +65,7 @@ darkroom check media.json                       # validate, with the exact place
 darkroom shoot media.json                       # shoot everything that isn't up to date
 darkroom shoot media.json --only walk --force   # reshoot one
 darkroom gallery media.json --relative-to README.md   # print markdown for the outputs
+darkroom gallery media.json --insert README.md        # update the images in a doc in place
 ```
 
 `darkroom shoot` prints each output and its size:
@@ -114,10 +115,10 @@ Top level:
 | Key | Meaning |
 |---|---|
 | `out` | Output directory, relative to the manifest (default `media`). |
-| `vars` | Values for `{name}` placeholders in `url`, `ready`, `argv`, `env` and `cwd`. Vars may use other vars. `--var name=value` overrides. Built in: `{manifest_dir}`, and for `command` shots `{out_dir}`, `{width}`, `{height}`, `{dpr}`, `{display}`, `{name}`, `{tag}`, `{i}`, `{n}`. Unknown placeholders are left alone, so JS and JSON braces are safe. |
+| `vars` | Values for `{name}` placeholders in `url`, `ready`, `argv`, `env`, `cwd` and `file`. Vars may use other vars. `--var name=value` overrides. A var can be a list, spliced into `argv` as a whole `"@name"` entry (see [Shared flags](#shared-flags-list-vars-and-key)). Built in: `{manifest_dir}`; with `each`, `{value}`, `{i}`, `{n}`; and for `command` shots `{out_dir}`, `{work_dir}`, `{width}`, `{height}`, `{dpr}`, `{display}`, `{name}`, `{tag}`. Unknown placeholders are left alone, so JS and JSON braces are safe. |
 | `devices` | Extra devices: `{ "name": { "width", "height", "dpr", "touch", "mobile" } }`. |
 | `budgets` | `still_kb` (200), `gif_mb` (3), `mp4_kb` (600), `webm_kb` (400). A shot can override any of them in its own `budgets`. |
-| `defaults` | Fields every shot starts from (objects merge one level deep; fields for the other backend are ignored). |
+| `defaults` | Fields every shot starts from. Objects merge one level deep, lists are replaced unless the shot writes `KEY+` to extend them (`argv+`, `steps+`, `setup+`, `block+`, `launchArgs+`), and fields for the other backend are ignored. |
 | `shots` | The list of shots. |
 
 Every shot:
@@ -125,17 +126,19 @@ Every shot:
 | Key | Meaning |
 |---|---|
 | `name` | Unique; becomes the file name (`name.jpg`, `name.gif`, ...). |
-| `kind` | `still` (one image), `clip` (frames from `capture` steps), or `pair` (before/after). |
+| `kind` | `still` (one image), `clip` (frames from `capture` steps), `pair` (before/after) or `grid` (a captioned composite of other shots). |
 | `backend` | `web` (default) or `command`. |
 | `device` | `desktop` (1280x720), `hd` (1920x1080), `phone` (390x844, DPR 3, touch, mobile), `landscape-phone` (844x390), a custom name, or an inline `{ "width", "height", ... }`. |
 | `caption`, `alt` | Used by the gallery. Say so in `alt` if `speed` > 1. |
 | `format`, `quality`, `width` | Stills: `jpg` (default) or `png`, starting JPEG quality (86), maximum width. |
+| `file` | Write the output to this path (relative to the manifest) instead of `<out>/<name>.<ext>`, so a shot can replace an existing image in place. The extension picks the format: `.jpg`/`.png` for stills, pairs and grids; `.gif`, `.mp4` or `.webm` for a clip (its other outputs share the name: `walk.gif`, `walk.mp4`, `walk-poster.jpg`). A tag goes before the extension (`seasons.before.png`). Vars, `{name}`, and with `each` `{value}`/`{i}`, are filled in. |
+| `each` | `web` and `command`: a list of values, one run each (a fresh browser or process), with `{value}`, `{i}` and `{n}` set (also in the page's `vars`). Implies `repeat` = its length. A still makes one image per value (`name-<value>.jpg`, or the `file` template); a clip plays the runs in order. |
 | `aspect` | Centre-crop every frame to a ratio such as `"16:9"` or `"1:1"`. |
 | `fps`, `speed` | Clip playback rate (12) and a speed-up factor. |
 | `gif` | `{ fps, width (640), palette, colors (256), dither (false), loop (0), budget_mb }`, or `false` for no GIF. Palettes: `octree` (per frame; keeps small saturated details), `median` (per frame, median cut), `adaptive` (one octree palette for the whole clip: no colour flicker). |
 | `video` | `["mp4"]`, `["webm"]` or both. |
 | `poster` | Frame for a poster JPEG: an index, or a fraction of the clip (default 0.6 when there is video). |
-| `sheet` | `true` also publishes the contact sheet (one is always kept with the take). |
+| `sheet` | `true` also publishes the contact sheet as `<name>-sheet.png` (one is always kept with the take for review); or `{ "labels": "none" \| "index" \| "caption", "cols": 4, "width": 1600 }`. `index` (default) labels tiles `#3`; `caption` uses each frame's `each` value. |
 | `retries`, `timeout`, `lock` | Attempts after the first (2), seconds per attempt, a lock name. |
 | `skip` | Leave the shot out of `shoot`. |
 
@@ -177,14 +180,63 @@ Steps (one verb per object):
 | Key | Meaning |
 |---|---|
 | `argv` | The program and its arguments, templated. It must write image files into `{out_dir}` (a fresh temporary directory per run). |
-| `env`, `cwd` | Extra environment (templated) and working directory (default: the manifest's). |
+| `env`, `cwd` | Extra environment (templated) and working directory. The default `cwd` is `{work_dir}`, a fresh scratch directory per run beside `{out_dir}` and deleted after it, so whatever else the program writes (an `imgui.ini`, logs, caches) never lands in your project and never becomes a frame. Relative paths in `argv` still mean the manifest's: the program when it has a slash (`./build/Game`), and any other entry that names an existing file next to the manifest (`render.py`) or an existing path with a slash (`scenes/title.json`). Paths inside a flag (`--scene=scenes/a.json`) and in `env` are not rewritten; write `{manifest_dir}/...` there. Set `"cwd": "{manifest_dir}"` for 0.1's behaviour; a relative `cwd` is relative to the manifest. |
 | `xvfb` | `true` (or `{ "args": [...] }`) runs the program on a private Xvfb display sized to the device. Xvfb picks a free display number itself, so parallel captures never collide; `{display}` and `$DISPLAY` hold it. Xvfb and the program run with software OpenGL (`LIBGL_ALWAYS_SOFTWARE=1`, `GALLIUM_DRIVER=llvmpipe`), which keeps GLX working where a host GPU driver would crash it (e.g. NVIDIA under WSL), so the program gets real OpenGL; `{ "env": {...} }` replaces those variables and `{ "env": {} }` drops them. If Xvfb still crashes at startup, darkroom starts it once more without GLX and warns. |
-| `repeat` | Run the program `n` times with `{i}` and `{n}` set; every image from every run is a frame, in order (camera orbits, scenario steps). |
+| `repeat` | Run the program `n` times with `{i}` and `{n}` set; every image from every run is a frame, in order (camera orbits, scenario steps). `each` (above) does the same with a value per run. |
 | `glob` | Which files to collect (default: every PNG, JPEG, WebP or BMP, sorted). |
 
-`examples/recipes/media.json` shows a native game with its own screenshot flags at three
-sizes, an engine's headless renderer, two builds compared as a pair, and a RAM-heavy rig
-behind a lock.
+`examples/recipes/media.json` shows a native game with its own screenshot flags at two
+sizes, an engine's headless renderer, two builds compared as a pair, a RAM-heavy rig
+behind a lock, and one still per season composed into a captioned grid.
+
+### Shared flags: list vars and `KEY+`
+
+A var can be a list. As a whole `argv` entry, `"@name"` splices its items in (a scalar var
+gives one entry; `@word` that is not a var is left alone, so `@file` arguments survive):
+
+```json
+{
+  "vars": { "game": "./build/MyGame", "common": ["--fast", "--seed", "7", "--no-audio"] },
+  "defaults": {
+    "backend": "command", "xvfb": true,
+    "argv": ["{game}", "@common", "--screenshot-dir", "{out_dir}"]
+  },
+  "shots": [
+    { "name": "title" },
+    { "name": "map", "argv+": ["--open", "map"] },
+    { "name": "seasons", "argv+": ["--season", "{value}"], "each": ["spring", "summer", "autumn", "winter"] }
+  ]
+}
+```
+
+`argv+` appends to the default's `argv`, so every shot keeps the shared flags without
+copying them. `--var common="--fast --seed 9"` overrides a list var (split like a shell).
+A list var inside a string (`"--x={common}"`) is an error: splice it with `@common`.
+
+### Grids
+
+A grid is a README composite: tiles in rows, a caption under each, an optional title, and
+no frame numbers. Tiles share the first tile's aspect ratio.
+
+```json
+{ "name": "season", "backend": "command", "each": ["spring", "summer", "autumn", "winter"],
+  "argv": ["{game}", "@common", "--season", "{value}", "--screenshot-dir", "{out_dir}"] },
+{ "name": "seasons", "kind": "grid", "of": "season", "title": "The four seasons",
+  "captions": ["Spring", "Summer", "Autumn", "Winter"], "file": "docs/images/seasons.png" }
+```
+
+| Key | Meaning |
+|---|---|
+| `of` | A still or clip whose take supplies the tiles: one per run for an `each`/`repeat` shot (its last frame), otherwise every frame. Captions default to the `each` values. |
+| `frames` | With `of`: pick frames of the take by index (negative counts from the end). |
+| `tiles` | Instead of `of`: a list of shot names (the last frame of each take) or objects `{ "shot", "frame", "caption" }` / `{ "image": "path", "caption" }`. A tile's caption defaults to its `each` value, then its shot's `caption`. |
+| `captions` | One caption per tile, overriding the defaults (`""` for none). |
+| `cols` | Columns (default: one row up to three tiles, 2x2 for four, then a square-ish grid). |
+| `title` | A title above the tiles. |
+
+The grid is about 1600 px wide (tiles are never upscaled), then budget-fitted like a still;
+`width`, `format`/`file`, `quality` and `aspect` work as for stills. Grids and pairs are made
+after the shots they read, and every time (they are cheap).
 
 ### Pairs
 
@@ -213,9 +265,18 @@ its outputs; `darkroom shoot` skips a shot whose hash and outputs are unchanged.
 
 ```sh
 darkroom shoot media.json --encode --only walk   # re-encode the last take (new budget, palette, aspect) without reshooting
-darkroom sheet media.json walk                   # contact sheet of a take
-darkroom sheet path/to/folder                    # contact sheet of any folder of images
+darkroom sheet media.json walk                   # contact sheet of a take -> <out>/walk-sheet.png
+darkroom sheet .darkroom/takes/walk              # the same, from the take folder
+darkroom sheet path/to/folder -o review.png      # contact sheet of any folder of images
 ```
+
+Sheets are for reviewing takes. Tiles are sized from the frames so the sheet is about 1600 px
+wide (`--width`; `--thumb` fixes the tile width; small frames are not upscaled), up to 24
+frames spread evenly across the take, labelled with the frame index (`--labels index`), the
+`each` value (`--labels caption`) or nothing (`--labels none`). With no `-o`, a manifest's
+sheet goes into its out dir, a take folder's into its manifest's out dir, and a plain
+folder's beside the folder (`<folder>-sheet.png`); nothing is written into a take. For a
+README composite use a [grid](#grids) instead.
 
 ## Locks
 
@@ -228,22 +289,49 @@ run twice at once. Locks are released when the process exits, even on a crash.
 
 ```sh
 darkroom gallery media.json --relative-to README.md          # markdown on stdout
-darkroom gallery media.json --insert README.md               # replace the block between the markers below
+darkroom gallery media.json --insert README.md               # fill the markers below
 darkroom gallery media.json --format html --write docs/media/index.html
+darkroom gallery media.json --insert ../pr-body.md \
+  --base-url https://raw.githubusercontent.com/OWNER/REPO/BRANCH/   # a PR body outside the repo
 ```
+
+`--insert` fills two kinds of marker. A whole-gallery block gets every shot:
 
 ```markdown
 <!-- darkroom:start -->
 <!-- darkroom:end -->
 ```
 
+A per-shot block gets one shot, so images can sit anywhere in your prose. Write either form;
+the self-closing one is expanded into the other on the first run, and later runs replace
+what is between the markers:
+
+```markdown
+The seasons change as you play:
+
+<!-- darkroom:shot seasons /-->
+
+<!-- darkroom:shot walk -->
+<!-- darkroom:end -->
+```
+
+A marker naming an unknown shot is an error; a shot with nothing shot yet is left as it is.
+
 Each shot becomes its image (a GIF before a still; a video becomes a poster linked to the
-MP4), its caption in italics, and a link to the MP4 when a clip has both.
+MP4; a still with `each`, one image per value), its caption in italics, and a link to the
+MP4 when a clip has both.
+
+**Links.** The project root is the git work tree holding the manifest (or the manifest's
+folder outside git). When the document is inside it, links are relative to the document.
+With `--base-url`, every link is that URL plus the file's path in the root, which resolves
+anywhere (PR bodies, release notes, issue comments). A document outside the root without
+`--base-url` is an error: darkroom never writes `../../..` paths out of the repo or a local
+absolute path.
 
 ## Exit codes
 
 `0` everything worked; `1` at least one shot failed (the others still ran); `2` the manifest
-is invalid or a name is unknown.
+is invalid, a name is unknown, or the gallery cannot link a document (see **Links** above).
 
 ## Credits
 
