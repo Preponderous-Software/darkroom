@@ -1,7 +1,10 @@
 """The command backend: run any program that writes images into a directory.
 
-Each capture gets its own temporary ``{out_dir}`` and, with ``xvfb: true``, its own Xvfb
-display (picked by Xvfb itself via ``-displayfd``), so parallel captures never collide.
+Each run gets its own temporary ``{out_dir}`` (where images are collected from), a sibling
+scratch ``{work_dir}`` that is the default working directory (so whatever else the program
+writes, such as config or cache files, never lands in the project) and, with ``xvfb: true``,
+its own Xvfb display (picked by Xvfb itself via ``-displayfd``), so parallel captures never
+collide.
 """
 from __future__ import annotations
 
@@ -14,7 +17,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from ..manifest import template
+from ..manifest import expand_argv, template
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 
@@ -93,18 +96,28 @@ def _collect(out_dir: Path, glob: str | None) -> list[Path]:
 
 
 def capture(shot, device: dict, variables: dict, frames_dir: Path, log=print) -> dict:
-    """Run the shot's argv (``repeat`` times, with {i}/{n}); copy every image it writes into
-    ``frames_dir`` in order. Returns {"frames": [...], "logs": [...]}."""
-    repeat = int(shot.get("repeat", 1))
+    """Run the shot's argv once per ``each`` value (or ``repeat`` times), with {i}/{n}/{value};
+    copy every image it writes into ``frames_dir`` in order. Returns {"frames", "runs",
+    "captions", "logs"}: ``runs`` and ``captions`` give each frame's run index and ``each`` value."""
+    each = shot.get("each")
+    repeat = len(each) if each else int(shot.get("repeat", 1))
     timeout = float(shot.get("timeout", 600))
     frames: list[str] = []
+    runs: list[int] = []
+    captions: list[str | None] = []
     logs: list[str] = []
     frames_dir.mkdir(parents=True, exist_ok=True)
     for i in range(repeat):
         with tempfile.TemporaryDirectory(prefix=f"darkroom-{shot.name}-") as tmp:
+            out_dir, work_dir = Path(tmp) / "out", Path(tmp) / "work"
+            out_dir.mkdir()
+            work_dir.mkdir()
             v = dict(variables)
-            v.update({"out_dir": tmp, "width": device["width"], "height": device["height"],
-                      "dpr": device.get("dpr", 1), "name": shot.name, "i": i, "n": repeat})
+            v.update({"out_dir": str(out_dir), "work_dir": str(work_dir), "width": device["width"],
+                      "height": device["height"], "dpr": device.get("dpr", 1), "name": shot.name,
+                      "i": i, "n": repeat})
+            if each:
+                v["value"] = each[i]
             xv = shot.get("xvfb")
             if xv:
                 xargs = xv.get("args", []) if isinstance(xv, dict) else []
@@ -116,7 +129,7 @@ def capture(shot, device: dict, variables: dict, frames_dir: Path, log=print) ->
             else:
                 v.setdefault("display", os.environ.get("DISPLAY", ""))
                 _run(shot, v, timeout, logs, None)
-            got = _collect(Path(tmp), shot.get("glob"))
+            got = _collect(out_dir, shot.get("glob"))
             if not got:
                 raise CaptureError(f"run {i + 1}/{repeat}: the command wrote no images into {{out_dir}}"
                                    + (f"; last output: {logs[-1][-400:]}" if logs else ""))
@@ -124,17 +137,25 @@ def capture(shot, device: dict, variables: dict, frames_dir: Path, log=print) ->
                 dest = frames_dir / f"{len(frames):05d}{f.suffix.lower()}"
                 shutil.copyfile(f, dest)
                 frames.append(str(dest))
-    return {"frames": frames, "logs": logs, "consoleErrors": []}
+                runs.append(i)
+                captions.append(str(each[i]) if each else None)
+    return {"frames": frames, "runs": runs, "captions": captions, "logs": logs, "consoleErrors": []}
 
 
 def _run(shot, v, timeout, logs, display, gl_env=None):
-    argv = template(shot["argv"], v)
+    argv = expand_argv(shot["argv"], v)
+    # The default cwd is the run's scratch dir, so a relative program path ("./build/Game")
+    # still means the manifest's, as it did when the manifest dir was the default cwd.
+    if os.sep in argv[0] and not os.path.isabs(argv[0]) and shot.get("cwd") is None:
+        argv[0] = os.path.normpath(os.path.join(v.get("manifest_dir", "."), argv[0]))
     env = dict(os.environ)
     env.update(gl_env or {})  # the same GL as the display's (the shot's own env still wins)
     env.update(template(shot.get("env", {}), v))
     if display:
         env["DISPLAY"] = display
-    cwd = template(shot.get("cwd", v.get("manifest_dir", ".")), v)
+    cwd = template(shot.get("cwd", "{work_dir}"), v)
+    if not os.path.isabs(cwd):
+        cwd = os.path.join(v.get("manifest_dir", "."), cwd)
     try:
         p = subprocess.run(argv, env=env, cwd=cwd, capture_output=True, text=True, timeout=timeout)
     except FileNotFoundError:

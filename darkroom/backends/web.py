@@ -35,6 +35,35 @@ def playwright_available(project_dir: Path | str = ".") -> bool:
 
 
 def capture(shot, device: dict, variables: dict, frames_dir: Path, log=print) -> dict:
+    """One browser run, or with ``each``, one fresh browser per value ({value}, {i}, {n} set in
+    the url and in the page's ``vars``); frames are concatenated in order."""
+    each = shot.get("each")
+    if not each:
+        result = _capture_once(shot, device, variables, frames_dir, log)
+        result["runs"] = [0] * len(result["frames"])
+        return result
+    frames: list[str] = []
+    runs: list[int] = []
+    captions: list[str] = []
+    errors: list[str] = []
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    for i, value in enumerate(each):
+        sub = frames_dir / f"run-{i}"
+        r = _capture_once(shot, device, dict(variables, value=value, i=i, n=len(each)), sub, log)
+        if not r["frames"]:
+            raise CaptureError(f"run {i + 1}/{len(each)} ({value}): no frames captured")
+        for f in r["frames"]:
+            dest = frames_dir / f"{len(frames):05d}{Path(f).suffix}"
+            shutil.move(f, dest)
+            frames.append(str(dest))
+            runs.append(i)
+            captions.append(str(value))
+        shutil.rmtree(sub, ignore_errors=True)
+        errors += r.get("consoleErrors") or []
+    return {"frames": frames, "runs": runs, "captions": captions, "consoleErrors": errors}
+
+
+def _capture_once(shot, device: dict, variables: dict, frames_dir: Path, log=print) -> dict:
     node = shutil.which("node")
     if not node:
         raise CaptureError("the web backend needs Node.js (node on PATH) and Playwright")

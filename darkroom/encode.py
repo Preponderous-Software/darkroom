@@ -6,6 +6,7 @@ optional ``imageio-ffmpeg`` package ships).
 from __future__ import annotations
 
 import io
+import math
 import os
 import shutil
 import subprocess
@@ -255,32 +256,111 @@ def encode_video(frames: Sequence[Image.Image], out: Path, fmt: str, budget_kb: 
 
 # ------------------------------------------------------------------ sheets and pairs
 
-def contact_sheet(frames: Sequence[Image.Image], out: Path, cols: int = 4, thumb_width: int = 320,
-                  labels: Sequence[str] | None = None, max_frames: int = 24) -> Result:
-    """A grid of thumbnails, each labelled (frame index by default)."""
+SHEET_WIDTH = 1600
+
+
+def contact_sheet(frames: Sequence[Image.Image], out: Path, cols: int | None = None,
+                  thumb_width: int | None = None, labels: str | Sequence[str | None] = "index",
+                  max_frames: int = 24, width: int = SHEET_WIDTH) -> Result:
+    """A grid of thumbnails for reviewing a take.
+
+    Tiles are sized from the frames so the sheet is about ``width`` pixels wide (never upscaled
+    past a frame's own width); ``thumb_width`` fixes the tile width instead. ``labels`` is
+    ``"index"`` (``#3``), ``"none"`` (no label bar), or one string per frame (``None`` entries
+    fall back to the index)."""
     frames = list(frames)
+    if not frames:
+        raise ValueError("contact sheet: no frames")
     idx = list(range(len(frames)))
     if len(frames) > max_frames:
         step = (len(frames) - 1) / (max_frames - 1)
         idx = sorted({round(i * step) for i in range(max_frames)})
-    thumbs = [resize_width(frames[i].convert("RGB"), thumb_width) for i in idx]
-    labels = [labels[i] for i in idx] if labels else [f"#{i}" for i in idx]
+    gap = 4
+    cols = max(1, min(cols or 4, len(idx)))
+    if not thumb_width:
+        widest = max(frames[i].width for i in idx)
+        thumb_width = max(64, min(widest, (width - (cols + 1) * gap) // cols))
+    thumbs = [_fit_width(frames[i].convert("RGB"), thumb_width) for i in idx]
+    if labels == "none":
+        texts = None
+    elif labels == "index" or labels is None:
+        texts = [f"#{i}" for i in idx]
+    else:
+        texts = [labels[i] if i < len(labels) and labels[i] is not None else f"#{i}" for i in idx]
     tw = max(t.width for t in thumbs)
     th = max(t.height for t in thumbs)
-    bar = 22
-    cols = min(cols, len(thumbs))
+    bar = 22 if texts else 0
     rows = (len(thumbs) + cols - 1) // cols
-    sheet = Image.new("RGB", (cols * tw + (cols + 1) * 4, rows * (th + bar) + (rows + 1) * 4), (20, 22, 28))
+    sheet = Image.new("RGB", (cols * tw + (cols + 1) * gap, rows * (th + bar) + (rows + 1) * gap), (20, 22, 28))
     d = ImageDraw.Draw(sheet)
     f = font(13)
-    for k, (t, lab) in enumerate(zip(thumbs, labels)):
-        x = 4 + (k % cols) * (tw + 4)
-        y = 4 + (k // cols) * (th + bar + 4)
+    for k, t in enumerate(thumbs):
+        x = gap + (k % cols) * (tw + gap)
+        y = gap + (k // cols) * (th + bar + gap)
         sheet.paste(t, (x, y))
-        d.text((x + 4, y + th + 4), lab, font=f, fill=(225, 228, 235))
+        if texts:
+            d.text((x + 4, y + th + 4), texts[k], font=f, fill=(225, 228, 235))
     out.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(out, optimize=True)
     return Result(out, out.stat().st_size)
+
+
+def _fit_width(im: Image.Image, width: int) -> Image.Image:
+    """Resize to exactly ``width`` (up or down), keeping the aspect ratio."""
+    if im.width == width:
+        return im
+    return im.resize((width, max(1, round(im.height * width / im.width))), Image.LANCZOS)
+
+
+GRID_THEMES = {"dark": ((24, 28, 36), (235, 236, 240), (200, 205, 212))}
+
+
+def grid(images: Sequence[Image.Image], captions: Sequence[str | None] = (), title: str | None = None,
+         cols: int | None = None, width: int = SHEET_WIDTH, gap: int = 12) -> Image.Image:
+    """A composite for READMEs: tiles in a grid, an optional caption centred under each tile
+    and an optional title above. No frame numbers. Tiles share the first image's aspect ratio
+    (others are centre-cropped to it) so rows line up."""
+    images = [im.convert("RGB") for im in images]
+    if not images:
+        raise ValueError("grid: no images")
+    n = len(images)
+    cols = max(1, min(cols or (n if n <= 3 else 2 if n == 4 else math.ceil(math.sqrt(n))), n))
+    tw = max(64, min(max(im.width for im in images), (width - (cols + 1) * gap) // cols))
+    th = max(1, round(images[0].height * tw / images[0].width))
+    ratio = f"{images[0].width}:{images[0].height}"
+    tiles = [_fit_width(crop_aspect(im, ratio), tw).resize((tw, th), Image.LANCZOS) for im in images]
+    caps = [(captions[i] if i < len(captions) else None) or "" for i in range(n)]
+    cap_font = font(max(14, min(28, tw // 18)))
+    title_font = font(max(18, min(40, (cols * tw) // 30)), bold=True)
+    cap_h = (_text_h(cap_font) + gap) if any(caps) else 0
+    title_h = (_text_h(title_font) + 2 * gap) if title else 0
+    rows = (n + cols - 1) // cols
+    bg, fg, muted = GRID_THEMES["dark"]
+    out = Image.new("RGB", (cols * tw + (cols + 1) * gap, title_h + rows * (th + cap_h) + (rows + 1) * gap), bg)
+    d = ImageDraw.Draw(out)
+    if title:
+        d.text((out.width // 2, gap + title_h // 2), title, font=title_font, fill=fg, anchor="mm")
+    for k, t in enumerate(tiles):
+        x = gap + (k % cols) * (tw + gap)
+        y = title_h + gap + (k // cols) * (th + cap_h + gap)
+        out.paste(t, (x, y))
+        if caps[k]:
+            d.text((x + tw // 2, y + th + gap // 2 + _text_h(cap_font) // 2), _ellipsize(d, caps[k], cap_font, tw),
+                   font=cap_font, fill=muted, anchor="mm")
+    return out
+
+
+def _text_h(f) -> int:
+    box = f.getbbox("Ag")
+    return box[3] - box[1] + 4
+
+
+def _ellipsize(d: ImageDraw.ImageDraw, text: str, f, width: int) -> str:
+    if d.textlength(text, font=f) <= width:
+        return text
+    while text and d.textlength(text + "…", font=f) > width:
+        text = text[:-1]
+    return text + "…"
 
 
 def side_by_side(left: Image.Image, right: Image.Image, labels=("before", "after"),
