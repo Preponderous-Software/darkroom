@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased
+
+Manifests, outputs and capture hashes are unchanged: nothing is reshot on upgrade.
+
+### Added
+
+- **Run-scoped process control.** Every process darkroom starts (the Node runner and the
+  Chromium it launches, `command` programs, Xvfb, ffmpeg) runs in a new session, so it leads
+  its own process group. Each `darkroom shoot` registers itself (pid, process groups,
+  manifest, cwd, start time, current shot) in `$DARKROOM_RUN_DIR`, else
+  `$XDG_RUNTIME_DIR/darkroom-runs`, else `/tmp/darkroom-runs-<uid>`, and on exit, an error,
+  Ctrl-C, SIGTERM or SIGHUP kills only its own groups, including descendants that started a
+  session of their own.
+- **`darkroom ps`** lists live runs (id, pid, age, current shot, manifest; `--json` too) and
+  prunes entries whose run is gone.
+- **`darkroom stop RUN-ID`** / **`darkroom stop --manifest PATH`** stops exactly one run:
+  SIGTERM, a grace period (`--timeout`, 15 s), then SIGKILL for whatever of its groups is
+  left. Pids are checked against their start time, so a recycled pid is never signalled. Use
+  it instead of `pkill -f`, which kills other projects' captures too.
+- **`lockTimeout`** (seconds) on shots and preps: give up waiting for a busy `lock` and fail
+  the attempt. The wait message now names the pid that holds the lock.
+- A warning when another run is already shooting the same manifest.
+
+### Fixed
+
+- A timed-out command or browser run could hang forever: `subprocess.run` killed only the
+  direct child, then waited for output pipes still held by its children (Chromium, a game's
+  helper). The whole tree is now killed and the drain after the kill is bounded.
+- Chromium, Xvfb and programs' helpers were left running after Ctrl-C, SIGTERM or a timeout.
+- A helper a `command` program forked and left running is killed when the program exits.
+- `.darkroom/state.json` is updated under a file lock (re-read, change one entry, write a temp
+  file and rename), so parallel `--only A` and `--only B` runs on one manifest no longer lose
+  each other's entries; the temp file is per process.
+- ffmpeg encodes and the Playwright availability probe have timeouts
+  (`$DARKROOM_FFMPEG_TIMEOUT`, default 900 s; 60 s).
+- Xvfb's display pipe is closed if Xvfb fails to start.
+- `darkroom shoot` exits `130` on Ctrl-C and `143` on SIGTERM, after cleaning up, instead of
+  a traceback.
+
+### Docs
+
+- README: "Stopping a run" (`ps`, `stop`, and why never `pkill -f`), `lockTimeout`, parallel
+  runs of one manifest, a "Used by" gallery (Tangle and Frozen Star), and the demo images
+  reshot with 0.4.
+
 ## 0.4.0 (2026-11-15)
 
 0.3 manifests keep working unchanged, and the hashes of unchanged shots are the same, so
