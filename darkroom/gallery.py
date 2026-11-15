@@ -138,12 +138,17 @@ class Linker:
 
 
 def _outputs(m: Manifest, state: State, shot) -> list[Path]:
+    if shot.prep:
+        return []  # a prep's outputs are data files, not media
     entry = state.get(shot.name)
     if entry:
         return [m.dir / o for o in entry.get("outputs", []) if (m.dir / o).exists()]
     # No state (e.g. outputs committed, state not): look for the usual names.
     base = output_base(m, shot, None)
-    found = []
+    found = [p for p, _, _ in named_stills(m, shot, [s.with_suffix(e) for s in _named_stems(m, shot).values()
+                                                     for e in (".jpg", ".png")])]
+    if found:
+        return found
     for suffix in (".jpg", ".jpeg", ".png", ".gif", ".mp4", ".webm", "-poster.jpg", "-sheet.png"):
         p = base.parent / (base.name + suffix)
         if p.exists():
@@ -190,6 +195,31 @@ def gallery_options(shot) -> dict:
     return g if isinstance(g, dict) else {}
 
 
+def _named_stems(m: Manifest, shot) -> dict[str, Path]:
+    """{key: output path without its extension} for a command still's named outputs."""
+    base = output_base(m, shot, None)
+    templated = "{key}" in (shot.get("file") or "")
+    return {key: (output_base(m, shot, None, {"key": key}) if templated else base.parent / f"{base.name}-{key}")
+            for key, _ in shot.named_outputs()}
+
+
+def named_stills(m: Manifest, shot, stills: list[Path]) -> list[tuple[Path, str, dict]]:
+    """(path, key, output entry) for each named output among ``stills``, in ``outputs`` order."""
+    by_stem = {p.with_suffix("").resolve(): p for p in stills if p.exists()}
+    entries = dict(shot.named_outputs())
+    out = []
+    for key, stem in _named_stems(m, shot).items():
+        p = by_stem.get(stem.resolve())
+        if p is not None:
+            out.append((p, key, entries[key]))
+    return out
+
+
+def _output_alt(o: dict, shot_alt: str, key: str) -> str:
+    text = o.get("alt") or o.get("caption")
+    return text.replace("]", ")").replace("\n", " ") if text else f"{shot_alt} ({key})"
+
+
 def shot_markdown(m: Manifest, shot, outs: list[Path], link) -> list[str]:
     alt = (shot.get("alt") or shot.get("caption") or shot.name).replace("]", ")").replace("\n", " ")
     c = classify(outs)
@@ -206,7 +236,14 @@ def shot_markdown(m: Manifest, shot, outs: list[Path], link) -> list[str]:
     video = c["video"]
     img = c["gif"] or (c["stills"][0] if c["stills"] else None) or (None if video else c["poster"])
     lines: list[str] = []
-    if len(c["stills"]) > 1 and not c["gif"]:
+    named = named_stills(m, shot, c["stills"]) if shot.named_outputs() else []
+    if named:
+        # Named outputs: each image with its own alt and caption, then the shot's caption.
+        for p, key, o in named:
+            lines += [image(p, _output_alt(o, alt, key)), ""]
+            if o.get("caption"):
+                lines += [f"*{o['caption']}*", ""]
+    elif len(c["stills"]) > 1 and not c["gif"]:
         values = _values(m, shot) or [p.stem for p in c["stills"]]
         for k, p in enumerate(c["stills"]):
             lines += [image(p, alt + (f" ({values[k]})" if k < len(values) else "")), ""]
@@ -245,6 +282,17 @@ def html_page(m: Manifest, relative_to: Path, only=None, title: str = "Media", b
     for shot, outs in entries(m, only):
         alt = html.escape(shot.get("alt") or shot.get("caption") or shot.name)
         c = classify(outs)
+        named = named_stills(m, shot, c["stills"]) if shot.named_outputs() else []
+        if named:
+            # One card per named output, with its own alt and caption.
+            w = gallery_options(shot).get("width")
+            size = f' width="{int(w)}" style="width:{int(w)}px;max-width:100%"' if w else ""
+            for p, key, o in named:
+                a = html.escape(o.get("alt") or o.get("caption") or f"{shot.get('alt') or shot.get('caption') or shot.name} ({key})")
+                cap = html.escape(o.get("caption") or shot.get("caption", ""))
+                cards.append(f'<figure><img src="{link(p)}" alt="{a}" loading="lazy"{size}><figcaption>'
+                             f'<b>{html.escape(shot.name)}-{html.escape(key)}</b> {cap}</figcaption></figure>')
+            continue
         if c["video"] and c["video"].suffix == ".mp4":
             poster = c["poster"]
             media = (f'<video controls muted loop playsinline preload="none"'

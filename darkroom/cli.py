@@ -9,7 +9,7 @@ from pathlib import Path
 from . import __version__
 from . import encode as enc
 from . import gallery
-from .manifest import ManifestError, load
+from .manifest import ManifestError, lint, load
 from .shoot import base_name, load_frames, make_pair, sheet_labels, shoot
 
 
@@ -40,6 +40,9 @@ def cmd_check(args):
         kinds[s.kind] = kinds.get(s.kind, 0) + 1
     print(f"{args.manifest}: OK, {len(m.shots)} shot(s) ("
           + ", ".join(f"{n} {k}" for k, n in kinds.items()) + f"); out: {m.out_dir}")
+    # Warnings, not errors: paths can be made by a prep or depend on --var.
+    for w in lint(m):
+        print(f"  warning: {w}", file=sys.stderr)
     return 0
 
 

@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+0.3 manifests keep working unchanged, and the hashes of unchanged shots are the same, so
+nothing is reshot on upgrade.
+
+### Added
+
+- **Prep shots** (#10): `"kind": "prep"` runs a command that writes files rather than
+  images (a server and bots for several minutes, a simulation), under its `lock`. It declares
+  the files it writes in `outputs` and is skipped while its argv, env, vars and inputs are
+  unchanged and those files exist. Its default `cwd` is the manifest's folder.
+- **`inputs`** on any shot (#10): paths, globs or directories whose file contents feed the
+  capture hash, so a changed input reshoots the shot instead of leaving it "up to date".
+- **`depends`** (#10): shot names that run first. Under `--only`, the preps a shot depends on
+  run too (unless up to date); a prep's outputs count as the dependent shot's inputs; when a
+  shot fails, the shots that depend on it are skipped. Cycles are a validation error.
+- **Named outputs on command stills** (#11): `"outputs": {"top": "top.png", "oblique":
+  "oblique.png"}` turns files one run writes into `{out_dir}` into `<name>-top.jpg`,
+  `<name>-oblique.jpg` (or a `file` template with `{key}`). Each entry can carry its own
+  `caption` and `alt` for the gallery.
+- **`darkroom check` warnings** (#12): a command shot's program that is not on `PATH` or at
+  its path, relative path-looking `argv` entries that do not exist, `inputs` that match
+  nothing and missing `initScript` files are reported as warnings; the exit code is unchanged.
+- **Web `initScript`** (#6): JS (a string, `{"file": path}`, or a list) that runs before the
+  page's own scripts via `context.addInitScript`, to seed storage or wrap
+  `requestAnimationFrame`. A file's contents feed the capture hash.
+- **Web `context`** (#6): Playwright `browser.newContext` options passed through
+  (`locale`, `timezoneId`, `colorScheme`, `reducedMotion`, `geolocation`, `permissions`,
+  ...). Options darkroom sets from `device` or `userAgent` are rejected with a pointer there.
+
+### Fixed
+
 - `gallery`: a clip with video but no GIF shows its poster linked to the video again (#9).
 
 ## 0.3.0 (2026-11-15)

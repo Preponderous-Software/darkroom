@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import copy
 import difflib
+import glob as _glob
 import hashlib
 import json
+import os
 import re
 import shlex
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,7 +27,7 @@ DEVICES: dict[str, dict[str, Any]] = {
 
 DEFAULT_BUDGETS = {"still_kb": 200, "gif_mb": 3.0, "mp4_kb": 600, "webm_kb": 400}
 
-KINDS = ("still", "clip", "pair", "grid")
+KINDS = ("still", "clip", "pair", "grid", "prep")
 # Kinds composed from other shots' takes (no backend, never captured themselves).
 COMPOSITE_KINDS = ("pair", "grid")
 BACKENDS = ("web", "command")
@@ -36,12 +39,19 @@ TOP_KEYS = {"$schema", "out", "vars", "devices", "budgets", "defaults", "shots",
 COMMON_SHOT_KEYS = {
     "name", "kind", "backend", "caption", "alt", "device", "retries", "timeout", "lock",
     "format", "quality", "width", "gif", "video", "poster", "sheet", "budgets", "skip", "comment",
-    "aspect", "speed", "fps", "file", "gallery", "every", "colors",
+    "aspect", "speed", "fps", "file", "gallery", "every", "colors", "inputs", "depends",
 }
 WEB_KEYS = {"url", "adapter", "ready", "readyTimeout", "css", "setup", "steps",
             "failOnConsoleError", "waitUntil", "launchArgs", "crop", "userAgent", "block", "each",
-            "screenshotTimeout", "frameStep"}
-COMMAND_KEYS = {"argv", "env", "cwd", "xvfb", "repeat", "glob", "each"}
+            "screenshotTimeout", "frameStep", "initScript", "context"}
+COMMAND_KEYS = {"argv", "env", "cwd", "xvfb", "repeat", "glob", "each", "outputs"}
+# A prep runs a command that writes files (no images): only these keys apply.
+PREP_KEYS = {"name", "kind", "backend", "comment", "skip", "lock", "timeout", "retries", "inputs",
+             "depends", "device", "argv", "env", "cwd", "xvfb", "outputs"}
+OUTPUT_KEYS = {"file", "caption", "alt"}
+# Browser-context options darkroom sets itself, and the shot field that sets each.
+CONTEXT_OWNED = {"viewport": "device", "deviceScaleFactor": "device (dpr)", "hasTouch": "device (touch)",
+                 "isMobile": "device (mobile)", "userAgent": "userAgent", "screen": "device"}
 PAIR_KEYS = {"of", "before", "after", "labels"}
 GRID_KEYS = {"of", "tiles", "frames", "cols", "title", "captions"}
 GRID_TILE_KEYS = {"shot", "frame", "image", "caption"}
@@ -69,7 +79,7 @@ STEP_KEYS = {
 # skip, failOnConsoleError) changes neither, so editing it never marks a shot stale.
 CAPTURE_FIELDS = {"kind", "backend", "device", "url", "adapter", "ready", "waitUntil", "css", "setup",
                   "steps", "crop", "userAgent", "block", "launchArgs", "each", "frameStep",
-                  "argv", "env", "cwd", "xvfb", "repeat", "glob"}
+                  "argv", "env", "cwd", "xvfb", "repeat", "glob", "initScript", "context"}
 ENCODE_FIELDS = {"format", "quality", "width", "gif", "video", "poster", "sheet", "aspect", "speed",
                  "fps", "file", "every", "colors", "of", "before", "after", "labels", "tiles",
                  "frames", "cols", "title", "captions"}
@@ -167,11 +177,24 @@ class Shot:
 
     @property
     def backend(self) -> str | None:
+        if self.kind == "prep":
+            return "command"
         return None if self.kind in COMPOSITE_KINDS else self.raw.get("backend", "web")
 
     @property
     def composite(self) -> bool:
         return self.kind in COMPOSITE_KINDS
+
+    @property
+    def prep(self) -> bool:
+        return self.kind == "prep"
+
+    def named_outputs(self) -> list[tuple[str, dict]]:
+        """A command still's ``outputs`` as (key, {"file", "caption"?, "alt"?}) in order."""
+        outs = self.raw.get("outputs")
+        if self.kind != "still" or not isinstance(outs, dict):
+            return []
+        return [(k, {"file": v} if isinstance(v, str) else dict(v)) for k, v in outs.items()]
 
 
 @dataclass
@@ -232,7 +255,10 @@ class Manifest:
                     merged[k] = v
             own = set(s) | {k[:-1] for k in s if k.endswith("+")}
             # Defaults that belong to another backend (or to no backend, for pairs) are dropped.
-            if merged.get("kind") in COMPOSITE_KINDS:
+            if merged.get("kind") == "prep":
+                # A prep takes only what applies to it from the defaults (no formats, captions...).
+                foreign = {k for k in merged if k not in PREP_KEYS} | {"backend"}
+            elif merged.get("kind") in COMPOSITE_KINDS:
                 foreign = WEB_KEYS | COMMAND_KEYS | {"backend", "device"}
             elif merged.get("backend", "web") == "command":
                 foreign = WEB_KEYS - COMMAND_KEYS
@@ -257,8 +283,41 @@ class Manifest:
         fields = {k: shot.raw[k] for k in sorted(CAPTURE_FIELDS) if k in shot.raw}
         fields["backend"] = shot.backend
         fields["kind"] = shot.kind
-        return _digest({"shot": fields, "vars": self.vars, "tag": tag,
-                        "device": self.device(shot.get("device", "desktop")) if not shot.composite else None})
+        if "outputs" in shot.raw:  # which files become which outputs; not their captions
+            outs = shot.raw["outputs"]
+            fields["outputs"] = ({k: v["file"] if isinstance(v, dict) else v for k, v in outs.items()}
+                                 if isinstance(outs, dict) else outs)
+        blob = {"shot": fields, "vars": self.vars, "tag": tag,
+                "device": self.device(shot.get("device", "desktop")) if not shot.composite else None}
+        # Only shots that read files (inputs, a prep's outputs, an init script file) get this
+        # key, so the hashes of every other shot are the same as in 0.3.
+        files = self.input_files(shot)
+        if files:
+            blob["inputs"] = files
+        return _digest(blob)
+
+    def input_patterns(self, shot: Shot) -> list[str]:
+        """The paths and globs (relative to the manifest, vars filled in) whose contents feed
+        a shot's capture hash: its ``inputs``, the ``outputs`` of the preps it ``depends`` on,
+        and its ``initScript`` files."""
+        pats = [str(x) for x in template(shot.get("inputs") or [], self.vars)]
+        if shot.get("depends"):
+            by_name = {s.name: s for s in self.shots}
+            for dep in shot["depends"]:
+                d = by_name.get(dep)
+                if d is not None and d.prep and isinstance(d.get("outputs"), list):
+                    pats += [str(x) for x in template(d["outputs"], self.vars)]
+        pats += [f for f in init_files(shot.get("initScript"), self.vars)]
+        return pats
+
+    def input_files(self, shot: Shot) -> dict[str, str | None]:
+        """{path relative to the manifest: sha256 of its content (None if missing)} for every
+        file the shot's input patterns name. A directory stands for every file under it."""
+        out: dict[str, str | None] = {}
+        for pat in self.input_patterns(shot):
+            for rel, path in expand_input(self.dir, pat):
+                out[rel] = _file_sha(path) if path is not None else None
+        return out
 
     def encode_hash(self, shot: Shot, tag: str | None) -> str:
         """Hash of what changes the outputs made from a take (formats, budgets, palettes, sizes,
@@ -281,6 +340,39 @@ class Manifest:
     def shot_hash(self, shot: Shot, tag: str | None) -> str:
         """Both hashes in one string (capture, then encode)."""
         return self.capture_hash(shot, tag) + "." + self.encode_hash(shot, tag)
+
+
+def init_files(init, variables: dict) -> list[str]:
+    """The ``{"file": path}`` entries of an ``initScript`` value, vars filled in."""
+    items = init if isinstance(init, list) else [init] if init is not None else []
+    return [str(template(i["file"], variables)) for i in items if isinstance(i, dict) and isinstance(i.get("file"), str)]
+
+
+def expand_input(base: Path, pattern: str) -> list[tuple[str, Path | None]]:
+    """(relative name, path) for each file a pattern names: a glob's matches, every file under a
+    directory, or the file itself. A pattern that names nothing gives one (pattern, None)."""
+    full = os.path.join(str(base), pattern)
+    if _glob.has_magic(pattern):
+        hits = sorted(Path(h) for h in _glob.glob(full, recursive=True))
+    else:
+        hits = [Path(full)] if os.path.exists(full) else []
+    files: list[Path] = []
+    for h in hits:
+        if h.is_dir():
+            files += sorted(p for p in h.rglob("*") if p.is_file())
+        elif h.is_file():
+            files.append(h)
+    if not files:
+        return [(pattern, None)]
+    return [(os.path.relpath(f, base), f) for f in files]
+
+
+def _file_sha(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
 
 
 def _digest(obj) -> str:
@@ -528,7 +620,7 @@ def validate(data: Any) -> list[str]:
     names: dict[str, int] = {}
     all_names = {s.get("name") for s in shots if isinstance(s, dict)}
     composites = {s.get("name"): s.get("kind") for s in shots
-                  if isinstance(s, dict) and s.get("kind") in COMPOSITE_KINDS}
+                  if isinstance(s, dict) and s.get("kind") in COMPOSITE_KINDS + ("prep",)}
     for shot in m.shots:
         s = shot.raw
         w = f"shots[{shot.index}]" + (f" ({s['name']})" if isinstance(s.get("name"), str) else "")
@@ -567,11 +659,17 @@ def validate(data: Any) -> list[str]:
             if "of" in s:
                 if s["of"] not in all_names:
                     p.append(f"{w}.of: no shot named '{s['of']}'{_suggest(str(s['of']), all_names)}")
+                elif composites.get(s["of"]) == "prep":
+                    p.append(f"{w}.of: '{s['of']}' is a prep, which makes no images; name a still or clip")
             elif not ("before" in s and "after" in s):
                 p.append(f"{w}: a pair needs 'of' (a shot shot with --tag before/after) or 'before' + 'after' image paths")
             labels = s.get("labels", ["before", "after"])
             if not (isinstance(labels, list) and len(labels) == 2):
                 p.append(f"{w}.labels: must be two strings")
+        elif kind == "prep":
+            _validate_prep(s, w, known_vars, p)
+            _validate_inputs(s, w, all_names, composites, known_vars, p)
+            continue
         else:
             if backend not in BACKENDS:
                 p.append(f"{w}.backend: must be one of {', '.join(BACKENDS)}{_suggest(str(backend), BACKENDS)}")
@@ -609,6 +707,11 @@ def validate(data: Any) -> list[str]:
                     p.append(f"{w}.url: unknown variable '{{{unknown}}}'{_suggest(unknown, known_vars)}")
                 no_list_in_strings(s.get("url", ""), f"{w}.url")
                 no_list_in_strings(s.get("ready") or "", f"{w}.ready")
+                _validate_init(s, w, known_vars, p)
+                if "outputs" in s:
+                    allowed.add("outputs")
+                    p.append(f"{w}.outputs: only command shots map written files to outputs; a web "
+                             f"still names its images with {{\"capture\": \"NAME\"}} steps")
             else:
                 argv = s.get("argv")
                 if not (isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv)):
@@ -629,6 +732,8 @@ def validate(data: Any) -> list[str]:
                         no_list_in_strings(cwd, f"{w}.cwd")
                 if "repeat" in s and not (isinstance(s["repeat"], int) and s["repeat"] >= 1):
                     p.append(f"{w}.repeat: must be a positive integer")
+                if "outputs" in s:
+                    _validate_named_outputs(s, w, kind, p)
             if "each" in s:
                 each = s["each"]
                 if not (isinstance(each, list) and each
@@ -637,6 +742,7 @@ def validate(data: Any) -> list[str]:
                 elif "repeat" in s and s["repeat"] != len(each):
                     p.append(f"{w}.repeat: 'each' already runs {len(each)} time(s); drop 'repeat' "
                              f"(it is {s['repeat']!r})")
+        _validate_inputs(s, w, all_names, composites, known_vars, p)
         _check_keys(s, allowed, w, p)
         fmt = s.get("format", "jpg")
         if fmt not in ("jpg", "png"):
@@ -655,8 +761,9 @@ def validate(data: Any) -> list[str]:
             elif kind != "clip" and "format" in s and STILL_EXTS[ext] != fmt:
                 p.append(f"{w}.format: '{fmt}' disagrees with file '{f}'; drop 'format' (the extension decides)")
             else:
-                for unknown in placeholders(f) - known_vars:
-                    p.append(f"{w}.file: unknown variable '{{{unknown}}}'{_suggest(unknown, known_vars)}")
+                file_vars = known_vars | ({"key"} if isinstance(s.get("outputs"), dict) else set())
+                for unknown in placeholders(f) - file_vars:
+                    p.append(f"{w}.file: unknown variable '{{{unknown}}}'{_suggest(unknown, file_vars)}")
         sheet = s.get("sheet")
         if isinstance(sheet, dict):
             _check_keys(sheet, SHEET_KEYS, f"{w}.sheet", p)
@@ -728,4 +835,226 @@ def validate(data: Any) -> list[str]:
             p.append(f"{w}.speed: must be a positive number (say so in the alt text when > 1)")
         if "retries" in s and not (isinstance(s["retries"], int) and s["retries"] >= 0):
             p.append(f"{w}.retries: must be a non-negative integer")
+    p += _dependency_cycles(m.shots)
     return p
+
+
+def _validate_prep(s: dict, w: str, known_vars: set, p: list[str]) -> None:
+    for k in s:
+        if k not in PREP_KEYS:
+            if k in COMMON_SHOT_KEYS | WEB_KEYS | COMMAND_KEYS | GRID_KEYS | PAIR_KEYS:
+                why = ("it runs once and makes no images" if k in ("each", "repeat", "glob")
+                       else "a prep makes no images" if k not in WEB_KEYS else "a prep runs a command")
+                p.append(f"{w}.{k}: not for a prep ({why}); a prep takes argv, env, cwd, xvfb, "
+                         f"outputs, inputs and depends")
+            else:
+                p.append(f"{w}: unknown key '{k}'{_suggest(k, PREP_KEYS)}")
+    if s.get("backend", "command") != "command":
+        p.append(f"{w}.backend: a prep runs a command; drop 'backend' (or set it to 'command')")
+    argv = s.get("argv")
+    if not (isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv)):
+        p.append(f"{w}.argv: required, a non-empty list of strings")
+    env = s.get("env", {})
+    if not isinstance(env, dict) or not all(isinstance(v, str) for v in env.values()):
+        p.append(f"{w}.env: must be an object of string values")
+    for unknown in (placeholders(argv or []) | placeholders(env)) - known_vars:
+        p.append(f"{w}: unknown variable '{{{unknown}}}' in argv/env{_suggest(unknown, known_vars)}")
+    if "cwd" in s and not isinstance(s["cwd"], str):
+        p.append(f"{w}.cwd: must be a path (default for a prep: the manifest's folder)")
+    outs = s.get("outputs")
+    if outs is None:
+        p.append(f"{w}.outputs: required, the files the prep writes (paths relative to the manifest), "
+                 f"e.g. [\"build/stats.json\"]; they decide whether it is up to date")
+    elif not (isinstance(outs, list) and outs and all(isinstance(o, str) and o.strip() for o in outs)):
+        p.append(f"{w}.outputs: must be a non-empty list of file paths relative to the manifest")
+    else:
+        for j, o in enumerate(outs):
+            if Path(o).is_absolute():
+                p.append(f"{w}.outputs[{j}]: must be relative to the manifest (absolute paths don't travel)")
+            elif _glob.has_magic(o):
+                p.append(f"{w}.outputs[{j}]: '{o}' is a glob; name each file the prep writes")
+            for unknown in placeholders(o) - known_vars:
+                p.append(f"{w}.outputs[{j}]: unknown variable '{{{unknown}}}'{_suggest(unknown, known_vars)}")
+
+
+def _validate_named_outputs(s: dict, w: str, kind: str, p: list[str]) -> None:
+    outs = s["outputs"]
+    if kind != "still":
+        p.append(f"{w}.outputs: only a command still has named outputs (a {kind} keeps every image "
+                 f"it writes as a frame)")
+        return
+    if not (isinstance(outs, dict) and outs):
+        p.append(f"{w}.outputs: must be an object of name -> file the command writes into {{out_dir}}, "
+                 f"e.g. {{\"top\": \"top.png\"}}")
+        return
+    for k, v in outs.items():
+        ow = f"{w}.outputs.{k}"
+        if not CAPTURE_NAME.fullmatch(k):
+            p.append(f"{ow}: '{k}' is not a file name; letters, digits, '.', '_' and '-' only")
+        if isinstance(v, dict):
+            _check_keys(v, OUTPUT_KEYS, ow, p)
+            for t in ("caption", "alt"):
+                if t in v and not isinstance(v[t], str):
+                    p.append(f"{ow}.{t}: must be a string")
+            v = v.get("file")
+            if v is None:
+                p.append(f"{ow}.file: required, the file the command writes into {{out_dir}}")
+                continue
+        if not (isinstance(v, str) and v.strip()):
+            p.append(f"{ow}: must be a file the command writes into {{out_dir}} (e.g. '{k}.png') or "
+                     f"{{\"file\": ..., \"caption\": ..., \"alt\": ...}}")
+        elif Path(v).is_absolute() or v.startswith(".."):
+            p.append(f"{ow}: '{v}' must be relative to {{out_dir}}, where the command writes it")
+        elif Path(v).suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+            p.append(f"{ow}: '{v}' is not an image (.png, .jpg, .jpeg, .webp or .bmp)")
+    for k in ("each", "glob"):
+        if k in s:
+            p.append(f"{w}.{k}: '{k}' and named outputs don't mix; outputs already name every image of the one run")
+    if s.get("repeat", 1) != 1:
+        p.append(f"{w}.repeat: named outputs come from one run; drop 'repeat'")
+    f = s.get("file")
+    if isinstance(f, str) and "{key}" not in f and placeholders(f) & {"value", "i"}:
+        p.append(f"{w}.file: use '{{key}}' (the output's name) in the file template, not '{{value}}'/'{{i}}'")
+
+
+def _validate_inputs(s: dict, w: str, all_names: set, kinds: dict, known_vars: set, p: list[str]) -> None:
+    if "inputs" in s:
+        ins = s["inputs"]
+        if not (isinstance(ins, list) and all(isinstance(x, str) and x.strip() for x in ins)):
+            p.append(f"{w}.inputs: must be a list of paths or globs relative to the manifest, "
+                     f"e.g. [\"data/*.json\"]")
+        else:
+            for j, x in enumerate(ins):
+                if Path(x).is_absolute():
+                    p.append(f"{w}.inputs[{j}]: must be relative to the manifest (absolute paths don't travel)")
+                for unknown in placeholders(x) - known_vars:
+                    p.append(f"{w}.inputs[{j}]: unknown variable '{{{unknown}}}'{_suggest(unknown, known_vars)}")
+    if "depends" in s:
+        deps = s["depends"]
+        if not (isinstance(deps, list) and all(isinstance(d, str) for d in deps)):
+            p.append(f"{w}.depends: must be a list of shot names that run first")
+            return
+        for j, d in enumerate(deps):
+            if d == s.get("name"):
+                p.append(f"{w}.depends[{j}]: a shot cannot depend on itself")
+            elif d not in all_names:
+                p.append(f"{w}.depends[{j}]: no shot named '{d}'{_suggest(d, all_names)}")
+
+
+def _validate_init(s: dict, w: str, known_vars: set, p: list[str]) -> None:
+    if "initScript" in s:
+        init = s["initScript"]
+        items = init if isinstance(init, list) else [init]
+        for j, it in enumerate(items):
+            iw = f"{w}.initScript" + (f"[{j}]" if isinstance(init, list) else "")
+            if isinstance(it, str):
+                if not it.strip():
+                    p.append(f"{iw}: empty script")
+                continue
+            if not (isinstance(it, dict) and set(it) == {"file"} and isinstance(it["file"], str) and it["file"].strip()):
+                p.append(f"{iw}: must be JS source (a string) or {{\"file\": \"path/to/init.js\"}} "
+                         f"(relative to the manifest), or a list of those")
+            elif Path(it["file"]).is_absolute():
+                p.append(f"{iw}.file: must be relative to the manifest (absolute paths don't travel)")
+            else:
+                for unknown in placeholders(it["file"]) - known_vars:
+                    p.append(f"{iw}.file: unknown variable '{{{unknown}}}'{_suggest(unknown, known_vars)}")
+    if "context" in s:
+        ctx = s["context"]
+        if not isinstance(ctx, dict):
+            p.append(f"{w}.context: must be an object of Playwright browser.newContext options, "
+                     f"e.g. {{\"reducedMotion\": \"reduce\", \"locale\": \"de-DE\"}}")
+            return
+        for k in ctx:
+            if k in CONTEXT_OWNED:
+                p.append(f"{w}.context.{k}: set by the shot's {CONTEXT_OWNED[k]}; set it there instead")
+
+
+def _dependency_cycles(shots: list[Shot]) -> list[str]:
+    graph = {s.raw.get("name"): [d for d in s.raw.get("depends") or [] if isinstance(d, str) and d != s.raw.get("name")]
+             for s in shots if isinstance(s.raw.get("depends"), list)}
+    problems, done = [], set()
+
+    def visit(n, path):
+        if n in path:
+            cyc = path[path.index(n):] + [n]
+            key = frozenset(cyc)
+            if key not in done:
+                done.add(key)
+                problems.append(f"depends: cycle {' -> '.join(cyc)}; a shot cannot (indirectly) depend on itself")
+            return
+        for d in graph.get(n, []):
+            visit(d, path + [n])
+    for n in graph:
+        visit(n, [])
+    return problems
+
+
+# Extensions that make an argv entry look like a file the program reads (a script or data).
+PATHY_EXTS = {".py", ".sh", ".bash", ".js", ".cjs", ".mjs", ".ts", ".rb", ".pl", ".lua", ".json", ".toml",
+              ".yaml", ".yml", ".ini", ".cfg", ".csv", ".txt", ".blend", ".scene", ".jar"}
+
+
+def lint(m: Manifest) -> list[str]:
+    """Warnings for a valid manifest: things that look wrong but may be fine at shoot time.
+
+    A command shot's (or prep's) program that is not on PATH or not at its path, relative
+    path-looking argv entries (with a '/' or a script/data extension) that don't exist, inputs
+    that match nothing and initScript files that don't exist. Paths a prep declares as outputs
+    are never reported (the prep makes them), nor entries with placeholders filled in at run
+    time ({out_dir}, {value}, ...)."""
+    warnings: list[str] = []
+    made = set()
+    for s in m.shots:
+        if s.prep and isinstance(s.get("outputs"), list):
+            made |= {os.path.normpath(str(o)) for o in template(s["outputs"], m.vars)}
+
+    def missing(rel: str, base: Path) -> bool:
+        path = os.path.normpath(os.path.join(str(base), rel))
+        if os.path.exists(path):
+            return False
+        return os.path.relpath(path, m.dir) not in made
+
+    for s in m.shots:
+        if s.get("skip"):
+            continue
+        w = f"shots[{s.index}] ({s.name})"
+        if s.backend == "command" and isinstance(s.get("argv"), list):
+            argv = expand_argv(s["argv"], m.vars)
+            cwd = s.get("cwd")
+            if cwd is None:  # relative paths are anchored to the manifest's folder
+                base = m.dir
+                where = "the manifest's folder"
+            else:
+                cwd = template(cwd, m.vars)
+                if placeholders(cwd):
+                    base = None  # {work_dir} etc.: only known at run time
+                else:
+                    base = Path(cwd) if os.path.isabs(cwd) else m.dir / cwd
+                    where = f"cwd '{s['cwd']}'"
+            for k, a in enumerate(argv):
+                if not a or placeholders(a) or a.startswith("-") or "://" in a:
+                    continue
+                if k == 0 and "/" not in a:
+                    if shutil.which(a) is None:
+                        warnings.append(f"{w}.argv[0]: program '{a}' is not on PATH")
+                    continue
+                looks = "/" in a or Path(a).suffix.lower() in PATHY_EXTS
+                if not looks:
+                    continue
+                if os.path.isabs(a):
+                    if not os.path.exists(a) and os.path.relpath(a, m.dir) not in made:
+                        shown = (os.path.join("{manifest_dir}", os.path.relpath(a, m.dir))
+                                 if Path(a).is_relative_to(m.dir) else a)
+                        warnings.append(f"{w}.argv[{k}]: '{shown}' does not exist")
+                elif base is not None and missing(a, base):
+                    warnings.append(f"{w}.argv[{k}]: '{a}' does not exist (relative to {where})")
+        for j, pat in enumerate(template(s.get("inputs") or [], m.vars)):
+            if not isinstance(pat, str) or placeholders(pat):
+                continue
+            if expand_input(m.dir, pat)[0][1] is None and os.path.normpath(pat) not in made:
+                warnings.append(f"{w}.inputs[{j}]: '{pat}' matches no files (yet)")
+        for f in init_files(s.get("initScript"), m.vars):
+            if not placeholders(f) and not (m.dir / f).is_file():
+                warnings.append(f"{w}.initScript: file '{f}' does not exist (relative to the manifest)")
+    return warnings

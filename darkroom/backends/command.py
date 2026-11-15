@@ -129,7 +129,13 @@ def capture(shot, device: dict, variables: dict, frames_dir: Path, log=print) ->
             else:
                 v.setdefault("display", os.environ.get("DISPLAY", ""))
                 _run(shot, v, timeout, logs, None)
-            got = _collect(out_dir, shot.get("glob"))
+            named = shot.named_outputs()
+            if named:
+                got = _named(out_dir, named, v, logs)
+                names = [k for k, _ in named]
+            else:
+                got = _collect(out_dir, shot.get("glob"))
+                names = []
             if not got:
                 raise CaptureError(f"run {i + 1}/{repeat}: the command wrote no images into {{out_dir}}"
                                    + (f"; last output: {logs[-1][-400:]}" if logs else ""))
@@ -139,7 +145,53 @@ def capture(shot, device: dict, variables: dict, frames_dir: Path, log=print) ->
                 frames.append(str(dest))
                 runs.append(i)
                 captions.append(str(each[i]) if each else None)
-    return {"frames": frames, "runs": runs, "captions": captions, "logs": logs, "consoleErrors": []}
+    out = {"frames": frames, "runs": runs, "captions": captions, "logs": logs, "consoleErrors": []}
+    if repeat == 1 and names:
+        out["names"] = names
+    return out
+
+
+def _named(out_dir: Path, named, v: dict, logs: list[str]) -> list[Path]:
+    """The files a command still's ``outputs`` name, in order; every one must exist."""
+    got, absent = [], []
+    for key, o in named:
+        f = out_dir / str(template(o["file"], v))
+        if f.is_file():
+            got.append(f)
+        else:
+            absent.append(f"outputs.{key}: '{o['file']}'")
+    if absent:
+        wrote = sorted(str(p.relative_to(out_dir)) for p in out_dir.rglob("*") if p.is_file())
+        raise CaptureError("the command did not write " + ", ".join(absent) + " into {out_dir}"
+                           + (f" (it wrote: {', '.join(wrote[:10])})" if wrote else " (it wrote nothing there)")
+                           + (f"; last output: {logs[-1][-400:]}" if logs and logs[-1] else ""))
+    return got
+
+
+def run_prep(shot, device: dict, variables: dict, log=print) -> list[str]:
+    """Run a prep's argv once. Its default working directory is the manifest's folder (it exists
+    to write files there); {out_dir} and {work_dir} are scratch dirs as for any command."""
+    timeout = float(shot.get("timeout", 600))
+    logs: list[str] = []
+    with tempfile.TemporaryDirectory(prefix=f"darkroom-{shot.name}-") as tmp:
+        out_dir, work_dir = Path(tmp) / "out", Path(tmp) / "work"
+        out_dir.mkdir()
+        work_dir.mkdir()
+        v = dict(variables)
+        v.update({"out_dir": str(out_dir), "work_dir": str(work_dir), "width": device["width"],
+                  "height": device["height"], "dpr": device.get("dpr", 1), "name": shot.name, "i": 0, "n": 1})
+        xv = shot.get("xvfb")
+        if xv:
+            xargs = xv.get("args", []) if isinstance(xv, dict) else []
+            xenv = xv.get("env") if isinstance(xv, dict) else None
+            xenv = XVFB_ENV if xenv is None else template(xenv, v)
+            with xvfb(device["width"], device["height"], xargs, log=log, env=xenv) as display:
+                v["display"] = display
+                _run(shot, v, timeout, logs, display, xenv, default_cwd="{manifest_dir}")
+        else:
+            v.setdefault("display", os.environ.get("DISPLAY", ""))
+            _run(shot, v, timeout, logs, None, default_cwd="{manifest_dir}")
+    return logs
 
 
 def anchor_paths(argv: list[str], manifest_dir: str) -> list[str]:
@@ -157,16 +209,16 @@ def anchor_paths(argv: list[str], manifest_dir: str) -> list[str]:
     return out
 
 
-def _run(shot, v, timeout, logs, display, gl_env=None):
+def _run(shot, v, timeout, logs, display, gl_env=None, default_cwd="{work_dir}"):
     argv = expand_argv(shot["argv"], v)
-    if shot.get("cwd") is None:
+    if shot.get("cwd") is None and default_cwd == "{work_dir}":
         argv = anchor_paths(argv, v.get("manifest_dir", "."))
     env = dict(os.environ)
     env.update(gl_env or {})  # the same GL as the display's (the shot's own env still wins)
     env.update(template(shot.get("env", {}), v))
     if display:
         env["DISPLAY"] = display
-    cwd = template(shot.get("cwd", "{work_dir}"), v)
+    cwd = template(shot.get("cwd", default_cwd), v)
     if not os.path.isabs(cwd):
         cwd = os.path.join(v.get("manifest_dir", "."), cwd)
     try:
