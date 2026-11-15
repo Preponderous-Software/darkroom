@@ -23,22 +23,29 @@ class CaptureError(Exception):
     pass
 
 
+# Xvfb's own GLX module loads the host's GL driver; some drivers (e.g. NVIDIA's under WSL) crash
+# it. Software GL (Mesa llvmpipe) in Xvfb's environment keeps GLX working, and the program then
+# gets real OpenGL on the display. `xvfb: {"env": {...}}` replaces these; `{"env": {}}` drops them.
+XVFB_ENV = {"LIBGL_ALWAYS_SOFTWARE": "1", "GALLIUM_DRIVER": "llvmpipe"}
+
+
 @contextmanager
-def xvfb(width: int, height: int, args=(), timeout: float = 30, log=print):
+def xvfb(width: int, height: int, args=(), timeout: float = 30, log=print, env=None):
     """Start a private Xvfb sized to the shot; yield its display string (e.g. ':57').
 
     Xvfb picks a free display itself (``-displayfd``), so parallel captures never collide.
-    If it dies at startup (some GPU drivers crash Xvfb's GLX module, e.g. under WSL), it is
-    started once more without GLX, with a warning."""
+    Xvfb runs with software GL (``XVFB_ENV``) unless ``env`` says otherwise. If it still dies
+    at startup, it is started once more without GLX, with a warning."""
+    env = XVFB_ENV if env is None else env
     try:
-        with _xvfb(width, height, list(args), timeout) as d:
+        with _xvfb(width, height, list(args), timeout, env) as d:
             yield d
             return
     except _XvfbDied as e:
         if "-extension" in args:
             raise CaptureError(str(e))
         log(f"  Xvfb died at startup ({e}); retrying with -extension GLX (no OpenGL on this display)")
-    with _xvfb(width, height, list(args) + ["-extension", "GLX"], timeout) as d:
+    with _xvfb(width, height, list(args) + ["-extension", "GLX"], timeout, env) as d:
         yield d
 
 
@@ -47,13 +54,13 @@ class _XvfbDied(CaptureError):
 
 
 @contextmanager
-def _xvfb(width: int, height: int, args: list, timeout: float):
+def _xvfb(width: int, height: int, args: list, timeout: float, env: dict):
     exe = shutil.which("Xvfb")
     if not exe:
         raise CaptureError("xvfb: true but Xvfb is not installed (apt install xvfb)")
     r, w = os.pipe()
     proc = subprocess.Popen([exe, "-displayfd", str(w), "-screen", "0", f"{width}x{height}x24",
-                             "-nolisten", "tcp", "-noreset", *args], pass_fds=(w,),
+                             "-nolisten", "tcp", "-noreset", *args], pass_fds=(w,), env={**os.environ, **env},
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     os.close(w)
     try:
@@ -101,9 +108,11 @@ def capture(shot, device: dict, variables: dict, frames_dir: Path, log=print) ->
             xv = shot.get("xvfb")
             if xv:
                 xargs = xv.get("args", []) if isinstance(xv, dict) else []
-                with xvfb(device["width"], device["height"], xargs, log=log) as display:
+                xenv = xv.get("env") if isinstance(xv, dict) else None
+                xenv = XVFB_ENV if xenv is None else template(xenv, v)
+                with xvfb(device["width"], device["height"], xargs, log=log, env=xenv) as display:
                     v["display"] = display
-                    _run(shot, v, timeout, logs, display)
+                    _run(shot, v, timeout, logs, display, xenv)
             else:
                 v.setdefault("display", os.environ.get("DISPLAY", ""))
                 _run(shot, v, timeout, logs, None)
@@ -118,9 +127,10 @@ def capture(shot, device: dict, variables: dict, frames_dir: Path, log=print) ->
     return {"frames": frames, "logs": logs, "consoleErrors": []}
 
 
-def _run(shot, v, timeout, logs, display):
+def _run(shot, v, timeout, logs, display, gl_env=None):
     argv = template(shot["argv"], v)
     env = dict(os.environ)
+    env.update(gl_env or {})  # the same GL as the display's (the shot's own env still wins)
     env.update(template(shot.get("env", {}), v))
     if display:
         env["DISPLAY"] = display
