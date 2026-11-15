@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `gallery`: a clip with video but no GIF shows its poster linked to the video again (#9).
+
 ## 0.3.0 (2026-11-15)
 
 From a second pilot: a Strata web-kit game shot in software WebGL on a heavily loaded machine.

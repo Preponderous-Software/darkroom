@@ -201,7 +201,10 @@ def shot_markdown(m: Manifest, shot, outs: list[Path], link) -> list[str]:
         if width:
             return f'<img src="{html.escape(link(p))}" alt="{html.escape(text)}" width="{int(width)}">'
         return f"![{text}]({link(p)})"
-    video, img = c["video"], c["gif"] or (c["stills"][0] if c["stills"] else None) or c["poster"]
+    # a clip with video and no GIF shows its poster linked to the video (below), so the poster is
+    # the main image only when there is no video
+    video = c["video"]
+    img = c["gif"] or (c["stills"][0] if c["stills"] else None) or (None if video else c["poster"])
     lines: list[str] = []
     if len(c["stills"]) > 1 and not c["gif"]:
         values = _values(m, shot) or [p.stem for p in c["stills"]]

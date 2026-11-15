@@ -325,3 +325,15 @@ def test_gallery_plain_without_options(write_manifest, fake_cmd):
     p = shot_clip_with_poster(write_manifest, fake_cmd, None)
     md = gallery.markdown(load(p), p.parent / "README.md")
     assert "![Walking](media/walk.gif)" in md and "<img" not in md
+
+
+def test_gallery_video_without_gif_links_poster_to_video(write_manifest, tmp_path):
+    # issue #9: a clip with "gif": false showed its poster as a plain image and never linked the video
+    p = write_manifest({"shots": [{"name": "dream", "kind": "clip", "gif": False, "video": ["mp4", "webm"],
+                                   "alt": "Dreaming", "url": "about:blank",
+                                   "steps": [{"repeat": 2, "steps": [{"capture": True}]}]}]})
+    m = load(p)
+    media = p.parent / "media"
+    outs = [media / "dream.mp4", media / "dream.webm", media / "dream-poster.jpg"]
+    md = gallery.shot_markdown(m, m.shots[0], outs, lambda q: q.relative_to(p.parent).as_posix())
+    assert "[![Dreaming](media/dream-poster.jpg)](media/dream.mp4)" in md
