@@ -45,6 +45,8 @@ def cmd_check(args):
 
 def cmd_shoot(args):
     m = _load(args)
+    if args.out:
+        m.out_override = Path(args.out).resolve()
     failed = shoot(m, only=args.only, tag=args.tag, retries=args.retries, force=args.force,
                    encode_only=args.encode)
     if failed:
@@ -164,11 +166,13 @@ def main(argv=None):
 
     p = sub.add_parser("shoot", help="capture and encode shots (skips up-to-date ones)")
     common(p)
-    p.add_argument("--only", nargs="+", metavar="NAME")
+    p.add_argument("--only", nargs="+", action="extend", metavar="NAME")
     p.add_argument("--tag", help="label this run, e.g. before / after (outputs NAME.TAG.*)")
     p.add_argument("--retries", type=int, help="attempts after the first (default: the shot's, else 2)")
     p.add_argument("--force", action="store_true", help="reshoot even if up to date")
     p.add_argument("--encode", action="store_true", help="re-encode the last takes without reshooting")
+    p.add_argument("--out", metavar="DIR", help="write every output (including 'file' ones) into DIR "
+                   "instead, e.g. a scratch dir for review; the takes are shared")
     p.set_defaults(fn=cmd_shoot)
 
     p = sub.add_parser("gallery", help="markdown (or HTML) for the outputs")
@@ -181,7 +185,7 @@ def main(argv=None):
     p.add_argument("--base-url", metavar="URL", help="link media as URL + path in the repo (e.g. "
                    "https://raw.githubusercontent.com/OWNER/REPO/BRANCH/), for PR bodies and other docs "
                    "outside the repo")
-    p.add_argument("--only", nargs="+", metavar="NAME")
+    p.add_argument("--only", nargs="+", action="extend", metavar="NAME")
     p.add_argument("--title", default="Media")
     p.set_defaults(fn=cmd_gallery)
 

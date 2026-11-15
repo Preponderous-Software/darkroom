@@ -14,6 +14,86 @@ START, END = "<!-- darkroom:start -->", "<!-- darkroom:end -->"
 SHOT_BLOCK = re.compile(r"<!--\s*darkroom:shot\s+([A-Za-z0-9][A-Za-z0-9._-]*)\s*(/)?-->"
                         r"(?(2)|.*?<!--\s*darkroom:end\s*-->)", re.S)
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+# Any one marker: start, end, or a shot opener (group 1 = name, group 2 = "/" if self-closing).
+MARKER = re.compile(r"<!--\s*darkroom:(?:start|end|shot\s+([A-Za-z0-9][A-Za-z0-9._-]*)\s*(/)?)\s*-->")
+FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+
+
+def code_regions(text: str) -> list[tuple[int, int]]:
+    """(start, end) offsets of fenced code blocks and inline code spans in markdown, where a
+    marker is documentation, not a marker."""
+    regions: list[tuple[int, int]] = []
+    pos, fence, fence_start = 0, None, 0
+    prose: list[tuple[int, int]] = []
+    for line in text.splitlines(keepends=True):
+        m = FENCE.match(line)
+        if fence is None and m:
+            fence, fence_start = m.group(1), pos
+        elif fence is not None and m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) \
+                and not line.strip().strip(fence[0]):
+            regions.append((fence_start, pos + len(line)))
+            fence = None
+        elif fence is None:
+            prose.append((pos, pos + len(line)))
+        pos += len(line)
+    if fence is not None:  # an unclosed fence runs to the end of the document
+        regions.append((fence_start, len(text)))
+    # Inline code: a run of N backticks up to the next run of exactly N (within prose, which
+    # may span lines of one paragraph).
+    for a, b in _merge(prose):
+        chunk = text[a:b]
+        i = 0
+        while True:
+            m = re.compile(r"`+").search(chunk, i)
+            if not m:
+                break
+            n = len(m.group(0))
+            close = re.compile(r"(?<!`)`{%d}(?!`)" % n).search(chunk, m.end())
+            if not close:
+                i = m.end()
+                continue
+            regions.append((a + m.start(), a + close.end()))
+            i = close.end()
+    return regions
+
+
+def _merge(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    for a, b in spans:
+        if out and out[-1][1] == a:
+            out[-1] = (out[-1][0], b)
+        else:
+            out.append((a, b))
+    return out
+
+
+def find_blocks(text: str) -> list[tuple[int, int, str | None]]:
+    """Marker blocks outside code: (start, end, shot name or None for the whole gallery).
+    A shot opener or start marker runs to the next end marker; a self-closing shot marker is a
+    block by itself. Markers inside code spans or fences are ignored."""
+    regions = code_regions(text)
+
+    def in_code(i: int) -> bool:
+        return any(a <= i < b for a, b in regions)
+    tokens = [m for m in MARKER.finditer(text) if not in_code(m.start())]
+    blocks, k = [], 0
+    while k < len(tokens):
+        t = tokens[k]
+        body = t.group(0)
+        if "darkroom:end" in body:
+            k += 1
+            continue
+        name = t.group(1)
+        if name and t.group(2):
+            blocks.append((t.start(), t.end(), name))
+            k += 1
+            continue
+        end = next((j for j in range(k + 1, len(tokens)) if "darkroom:end" in tokens[j].group(0)), None)
+        if end is None:
+            break
+        blocks.append((t.start(), tokens[end].end(), name))
+        k = end + 1
+    return blocks
 
 
 class GalleryError(Exception):
@@ -105,20 +185,37 @@ def _values(m: Manifest, shot) -> list[str]:
     return [str(v) for v in shot.get("each") or []]
 
 
+def gallery_options(shot) -> dict:
+    g = shot.get("gallery")
+    return g if isinstance(g, dict) else {}
+
+
 def shot_markdown(m: Manifest, shot, outs: list[Path], link) -> list[str]:
     alt = (shot.get("alt") or shot.get("caption") or shot.name).replace("]", ")").replace("\n", " ")
     c = classify(outs)
+    opts = gallery_options(shot)
+    width = opts.get("width")
+
+    def image(p: Path, text: str) -> str:
+        # A width needs HTML; GitHub and most renderers keep <img> in markdown.
+        if width:
+            return f'<img src="{html.escape(link(p))}" alt="{html.escape(text)}" width="{int(width)}">'
+        return f"![{text}]({link(p)})"
     video, img = c["video"], c["gif"] or (c["stills"][0] if c["stills"] else None) or c["poster"]
     lines: list[str] = []
     if len(c["stills"]) > 1 and not c["gif"]:
-        values = _values(m, shot)
+        values = _values(m, shot) or [p.stem for p in c["stills"]]
         for k, p in enumerate(c["stills"]):
-            lines += [f"![{alt}" + (f" ({values[k]})" if k < len(values) else "") + f"]({link(p)})", ""]
+            lines += [image(p, alt + (f" ({values[k]})" if k < len(values) else "")), ""]
     elif video and not img:
         poster = c["poster"]
-        lines += [f"[![{alt}]({link(poster)})]({link(video)})" if poster else f"[{alt}]({link(video)})", ""]
+        lines += [f"[{image(poster, alt)}]({link(video)})" if poster else f"[{alt}]({link(video)})", ""]
     elif img:
-        lines += [f"![{alt}]({link(img)})", ""]
+        if c["gif"] and opts.get("poster") and c["poster"]:
+            # The poster beside the GIF: two images in one paragraph sit side by side.
+            lines += [image(c["poster"], f"{alt} (poster)") + " " + image(img, alt), ""]
+        else:
+            lines += [image(img, alt), ""]
     else:
         return []
     if shot.get("caption"):
@@ -152,9 +249,13 @@ def html_page(m: Manifest, relative_to: Path, only=None, title: str = "Media", b
                      f'<source src="{link(c["video"])}" type="video/mp4"></video>')
         else:
             imgs = [c["gif"]] if c["gif"] else c["stills"] or ([c["poster"]] if c["poster"] else [])
+            if c["gif"] and c["poster"] and gallery_options(shot).get("poster"):
+                imgs = [c["poster"], c["gif"]]
             if not imgs:
                 continue
-            media = "".join(f'<img src="{link(i)}" alt="{alt}" loading="lazy">' for i in imgs)
+            w = gallery_options(shot).get("width")
+            size = f' width="{int(w)}" style="width:{int(w)}px;max-width:100%"' if w else ""
+            media = "".join(f'<img src="{link(i)}" alt="{alt}" loading="lazy"{size}>' for i in imgs)
         cap = html.escape(shot.get("caption", ""))
         cards.append(f'<figure>{media}<figcaption><b>{html.escape(shot.name)}</b> {cap}</figcaption></figure>')
     return f"""<!doctype html>
@@ -192,7 +293,8 @@ def update_doc(m: Manifest, doc: Path, only=None, base_url: str | None = None) -
     text = doc.read_text()
     link = Linker(m, doc.parent, base_url)
     names = {s.name for s in m.shots}
-    unknown = sorted({mm.group(1) for mm in SHOT_BLOCK.finditer(text)} - names)
+    blocks = find_blocks(text)
+    unknown = sorted({name for _, _, name in blocks if name} - names)
     if unknown:
         from .manifest import _suggest
         raise GalleryError(f"{doc.name}: marker for unknown shot(s) "
@@ -200,28 +302,35 @@ def update_doc(m: Manifest, doc: Path, only=None, base_url: str | None = None) -
     state = State(m)
     done: list[str] = []
 
-    def shot_block(mm: re.Match) -> str:
-        name = mm.group(1)
+    def shot_block(name: str, original: str) -> str:
         if only and name not in only:
-            return mm.group(0)
+            return original
         shot = m.shot(name)
         outs = _outputs(m, state, shot)
         if not outs:
-            return mm.group(0)  # nothing shot yet: leave the block as it is
+            return original  # nothing shot yet: leave the block as it is
         body = "\n".join(shot_markdown(m, shot, outs, link)).rstrip()
         done.append(name)
         return f"<!-- darkroom:shot {name} -->\n{body}\n<!-- darkroom:end -->"
 
-    # Whole-gallery block first (its END is the first darkroom:end after START), then shots.
-    found = False
-    if START in text and END in text[text.index(START):]:
-        found = True
-        snippet = markdown(m, doc, only, base_url=base_url)
-        text = re.sub(re.escape(START) + r".*?" + re.escape(END), lambda _: f"{START}\n{snippet}{END}",
-                      text, count=1, flags=re.S)
-        done.append("gallery")
-    text, n = SHOT_BLOCK.subn(shot_block, text)
-    found = found or n > 0
+    # Markers inside code spans and fenced blocks are documentation and are left alone.
+    found = bool(blocks)
+    pieces, pos, gallery_done = [], 0, False
+    for a, b, name in blocks:
+        pieces.append(text[pos:a])
+        if name is None:
+            if gallery_done:
+                pieces.append(text[a:b])
+            else:
+                snippet = markdown(m, doc, only, base_url=base_url)
+                pieces.append(f"{START}\n{snippet}{END}")
+                done.append("gallery")
+                gallery_done = True
+        else:
+            pieces.append(shot_block(name, text[a:b]))
+        pos = b
+    pieces.append(text[pos:])
+    text = "".join(pieces)
     if not found:
         raise GalleryError(f"{doc.name}: no markers; add {START} ... {END} for the whole gallery, or "
                            f"<!-- darkroom:shot NAME --> ... {END} (or <!-- darkroom:shot NAME /-->) per shot")

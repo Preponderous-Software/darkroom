@@ -14,6 +14,33 @@ from .command import CaptureError
 RUNNER = Path(__file__).resolve().parent.parent / "web" / "runner.cjs"
 LAUNCH_ARGS = ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader",
                "--ignore-gpu-blocklist"]
+# Playwright's own default is 30 s, which a software-WebGL page on a loaded machine can miss
+# on every attempt.
+SCREENSHOT_TIMEOUT_MS = 120000
+
+
+def action_timeout_ms(shot) -> int:
+    """The timeout for every Playwright call that can time out (screenshots, clicks, taps,
+    navigation): ``screenshotTimeout`` (ms), else the shot's ``timeout`` (s), else 120 s."""
+    if shot.get("screenshotTimeout"):
+        return int(shot["screenshotTimeout"])
+    if shot.get("timeout"):
+        return int(float(shot["timeout"]) * 1000)
+    return SCREENSHOT_TIMEOUT_MS
+
+
+def template_steps(steps, variables: dict):
+    """Fill vars into ``goto`` URLs (other step text is JS, which sees ``vars`` itself)."""
+    out = []
+    for st in steps or []:
+        if isinstance(st, dict):
+            st = dict(st)
+            if isinstance(st.get("goto"), str):
+                st["goto"] = template(st["goto"], variables)
+            if isinstance(st.get("steps"), list):
+                st["steps"] = template_steps(st["steps"], variables)
+        out.append(st)
+    return out
 
 
 def node_env(project_dir: Path) -> dict:
@@ -79,8 +106,10 @@ def _capture_once(shot, device: dict, variables: dict, frames_dir: Path, log=pri
             "readyTimeout": int(shot.get("readyTimeout", 120000)),
             "waitUntil": shot.get("waitUntil", "load"),
             "css": shot.get("css"),
-            "setup": shot.get("setup", []),
-            "steps": shot.get("steps", []),
+            "setup": template_steps(shot.get("setup", []), variables),
+            "steps": template_steps(shot.get("steps", []), variables),
+            "timeoutMs": action_timeout_ms(shot),
+            "frameStep": float(shot.get("frameStep", 1 / 30)),
             "device": device,
             "crop": shot.get("crop"),
             "userAgent": shot.get("userAgent"),
@@ -105,7 +134,10 @@ def _capture_once(shot, device: dict, variables: dict, frames_dir: Path, log=pri
         raise CaptureError(result["error"] + (f"\npage errors: {errs[:5]}" if errs else ""))
     marks = result.get("marks", {})
     frames = result["frames"]
+    names = result.get("names") or [None] * len(frames)
     if marks:
         frames = frames[marks.get("in", 0):marks.get("out", len(frames))]
+        names = names[marks.get("in", 0):marks.get("out", len(names))]
     result["frames"] = frames
+    result["names"] = names
     return result

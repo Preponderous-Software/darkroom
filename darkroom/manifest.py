@@ -36,10 +36,11 @@ TOP_KEYS = {"$schema", "out", "vars", "devices", "budgets", "defaults", "shots",
 COMMON_SHOT_KEYS = {
     "name", "kind", "backend", "caption", "alt", "device", "retries", "timeout", "lock",
     "format", "quality", "width", "gif", "video", "poster", "sheet", "budgets", "skip", "comment",
-    "aspect", "speed", "fps", "file",
+    "aspect", "speed", "fps", "file", "gallery", "every", "colors",
 }
 WEB_KEYS = {"url", "adapter", "ready", "readyTimeout", "css", "setup", "steps",
-            "failOnConsoleError", "waitUntil", "launchArgs", "crop", "userAgent", "block", "each"}
+            "failOnConsoleError", "waitUntil", "launchArgs", "crop", "userAgent", "block", "each",
+            "screenshotTimeout", "frameStep"}
 COMMAND_KEYS = {"argv", "env", "cwd", "xvfb", "repeat", "glob", "each"}
 PAIR_KEYS = {"of", "before", "after", "labels"}
 GRID_KEYS = {"of", "tiles", "frames", "cols", "title", "captions"}
@@ -50,14 +51,28 @@ SHEET_LABELS = ("none", "index", "caption")
 APPENDABLE = ("argv", "steps", "setup", "block", "launchArgs")
 STILL_EXTS = {".jpg": "jpg", ".jpeg": "jpg", ".png": "png"}
 CLIP_EXTS = (".gif", ".mp4", ".webm")
-GIF_KEYS = {"fps", "width", "palette", "colors", "dither", "loop", "budget_mb"}
+GIF_KEYS = {"fps", "width", "palette", "colors", "dither", "loop", "budget_mb", "hold_last_ms", "every"}
+VIDEO_KEYS = {"formats", "every", "hold_last"}
+GALLERY_KEYS = {"width", "poster"}
+CAPTURE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 DEVICE_KEYS = {"width", "height", "dpr", "touch", "mobile"}
 
 STEP_KEYS = {
     "js": set(), "key": {"action"}, "tap": set(), "click": set(), "wait": set(),
-    "waitFor": {"timeout"}, "frames": set(), "camera": set(), "capture": set(),
+    "waitFor": {"timeout"}, "frames": {"step"}, "camera": set(), "capture": set(),
     "repeat": {"steps", "var"}, "css": set(), "type": set(), "mark": set(),
+    "until": {"steps", "max", "then", "var"}, "goto": set(), "reload": set(),
 }
+
+# What changes the captured pixels (a reshoot) and what changes only the encoding (re-encode
+# the saved take). Anything else (caption, alt, gallery, retries, lock, timeouts, comment,
+# skip, failOnConsoleError) changes neither, so editing it never marks a shot stale.
+CAPTURE_FIELDS = {"kind", "backend", "device", "url", "adapter", "ready", "waitUntil", "css", "setup",
+                  "steps", "crop", "userAgent", "block", "launchArgs", "each", "frameStep",
+                  "argv", "env", "cwd", "xvfb", "repeat", "glob"}
+ENCODE_FIELDS = {"format", "quality", "width", "gif", "video", "poster", "sheet", "aspect", "speed",
+                 "fps", "file", "every", "colors", "of", "before", "after", "labels", "tiles",
+                 "frames", "cols", "title", "captions"}
 CAMERA_KEYS = {"yaw", "pitch", "dist", "tx", "ty", "tz"}
 
 _VAR = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -164,6 +179,8 @@ class Manifest:
     path: Path
     data: dict[str, Any]
     vars: dict[str, Any] = field(default_factory=dict)
+    # `shoot --out DIR`: every output (including `file` ones) goes here instead.
+    out_override: Path | None = None
 
     @property
     def dir(self) -> Path:
@@ -171,6 +188,8 @@ class Manifest:
 
     @property
     def out_dir(self) -> Path:
+        if self.out_override is not None:
+            return Path(self.out_override).resolve()
         return (self.dir / self.data.get("out", "media")).resolve()
 
     @property
@@ -231,13 +250,41 @@ class Manifest:
                 return s
         raise KeyError(f"no shot named '{name}'" + _suggest(name, [s.name for s in self.shots]))
 
-    def shot_hash(self, shot: Shot, tag: str | None) -> str:
-        from . import __version__
+    def capture_hash(self, shot: Shot, tag: str | None) -> str:
+        """Hash of what changes the captured frames: the page or program, its steps, the device
+        and the vars. A change means a reshoot. Not the darkroom version, retries, locks,
+        timeouts or presentation fields, so none of those make a shot stale."""
+        fields = {k: shot.raw[k] for k in sorted(CAPTURE_FIELDS) if k in shot.raw}
+        fields["backend"] = shot.backend
+        fields["kind"] = shot.kind
+        return _digest({"shot": fields, "vars": self.vars, "tag": tag,
+                        "device": self.device(shot.get("device", "desktop")) if not shot.composite else None})
+
+    def encode_hash(self, shot: Shot, tag: str | None) -> str:
+        """Hash of what changes the outputs made from a take (formats, budgets, palettes, sizes,
+        output paths). A change alone means re-encoding the saved take, not a reshoot."""
+        fields = {k: shot.raw[k] for k in sorted(ENCODE_FIELDS) if k in shot.raw}
+        gallery = shot.raw.get("gallery")
+        if isinstance(gallery, dict) and gallery.get("poster"):
+            fields["gallery.poster"] = True  # makes a poster file; gallery.width does not
+        return _digest({"shot": fields, "budgets": self.budgets(shot), "tag": tag,
+                        "out": str(self.out_dir), "file_vars": template(shot.raw.get("file"), self.vars)})
+
+    def legacy_hash(self, shot: Shot, tag: str | None, version: str) -> str:
+        """The 0.1/0.2 whole-shot hash, to recognise state written by those versions."""
         blob = json.dumps({"shot": shot.raw, "vars": self.vars, "tag": tag,
-                           "budgets": self.budgets(shot), "version": __version__,
+                           "budgets": self.budgets(shot), "version": version,
                            "device": self.device(shot.get("device", "desktop")) if not shot.composite else None},
                           sort_keys=True)
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+    def shot_hash(self, shot: Shot, tag: str | None) -> str:
+        """Both hashes in one string (capture, then encode)."""
+        return self.capture_hash(shot, tag) + "." + self.encode_hash(shot, tag)
+
+
+def _digest(obj) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
 def load(path: str | Path, overrides: dict[str, str] | None = None) -> Manifest:
@@ -275,7 +322,7 @@ def _num(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
-def validate_steps(steps, where: str, adapter: str, problems: list[str]):
+def validate_steps(steps, where: str, adapter: str, problems: list[str], kind: str = "clip"):
     if not isinstance(steps, list):
         problems.append(f"{where}: must be a list of steps")
         return
@@ -305,10 +352,24 @@ def validate_steps(steps, where: str, adapter: str, problems: list[str]):
                 problems.append(f"{w}.key: must be a key name like 'KeyW' or 'Enter'")
             if st.get("action", "press") not in ("down", "up", "press"):
                 problems.append(f"{w}.action: must be down, up or press")
-        elif verb == "tap" and not (isinstance(v, list) and len(v) == 2 and all(_num(x) for x in v)):
-            problems.append(f"{w}.tap: must be [x, y] in CSS pixels")
+        elif verb == "tap" and not (isinstance(v, str) and v.strip()
+                                    or isinstance(v, list) and len(v) == 2 and all(_num(x) for x in v)):
+            problems.append(f"{w}.tap: must be [x, y] in CSS pixels or a CSS selector (tapped at its centre)")
         elif verb in ("wait", "frames") and not (_num(v) and v >= 0):
             problems.append(f"{w}.{verb}: must be a non-negative number")
+        elif verb == "goto" and not (isinstance(v, str) and v.strip()):
+            problems.append(f"{w}.goto: must be a URL (absolute, or relative to the current page)")
+        elif verb == "reload" and v is not True:
+            problems.append(f"{w}.reload: must be true")
+        elif verb == "capture":
+            if isinstance(v, str):
+                if kind != "still":
+                    problems.append(f"{w}.capture: a named capture ('{v}') makes a still file; in a "
+                                    f"{kind} use {{\"capture\": true}}")
+                elif not CAPTURE_NAME.fullmatch(v):
+                    problems.append(f"{w}.capture: '{v}' is not a file name; letters, digits, '.', '_' and '-' only")
+            elif v is not True:
+                problems.append(f"{w}.capture: must be true (a clip frame) or a name (a still written as NAME.jpg)")
         elif verb == "camera":
             if not isinstance(v, dict):
                 problems.append(f"{w}.camera: must be an object with {sorted(CAMERA_KEYS)}")
@@ -319,7 +380,24 @@ def validate_steps(steps, where: str, adapter: str, problems: list[str]):
         elif verb == "repeat":
             if not (isinstance(v, int) and v >= 0):
                 problems.append(f"{w}.repeat: must be a non-negative integer")
-            validate_steps(st.get("steps", []), f"{w}.steps", adapter, problems)
+            validate_steps(st.get("steps", []), f"{w}.steps", adapter, problems, kind)
+        elif verb == "until":
+            if not (isinstance(v, str) and v.strip()):
+                problems.append(f"{w}.until: must be a JS expression; the steps repeat until it is truthy")
+            mx = st.get("max")
+            if not (isinstance(mx, int) and not isinstance(mx, bool) and mx >= 1):
+                problems.append(f"{w}.max: required, a positive integer (the most passes before giving up)")
+            then = st.get("then", 0)
+            if not (isinstance(then, int) and not isinstance(then, bool) and then >= 0):
+                problems.append(f"{w}.then: must be a non-negative integer (passes to run after the condition holds)")
+            if "steps" not in st:
+                problems.append(f"{w}.steps: required, the steps to repeat")
+            validate_steps(st.get("steps", []), f"{w}.steps", adapter, problems, kind)
+        if verb == "frames" and "step" in st:
+            if adapter != "strata-kit":
+                problems.append(f"{w}.step: only the strata-kit adapter drives a clock; drop 'step'")
+            elif not (_num(st["step"]) and st["step"] > 0):
+                problems.append(f"{w}.step: must be a positive number of seconds per frame (e.g. 0.1)")
 
 
 def _validate_grid(s: dict, w: str, all_names: set, composites: dict, p: list[str]) -> None:
@@ -367,6 +445,32 @@ def _validate_grid(s: dict, w: str, all_names: set, composites: dict, p: list[st
         p.append(f"{w}.cols: must be a positive integer")
     if "title" in s and not isinstance(s["title"], str):
         p.append(f"{w}.title: must be a string")
+
+
+def _every_ok(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 1
+
+
+def still_ext(s: dict) -> str:
+    f = s.get("file")
+    if isinstance(f, str) and Path(f).suffix.lower() in STILL_EXTS:
+        return STILL_EXTS[Path(f).suffix.lower()]
+    return s.get("format", "jpg")
+
+
+def _named_captures(s: dict) -> list[str]:
+    """Names of the ``{"capture": "name"}`` steps of a shot, in order."""
+    names: list[str] = []
+
+    def walk(steps):
+        for st in steps if isinstance(steps, list) else []:
+            if isinstance(st, dict):
+                if isinstance(st.get("capture"), str):
+                    names.append(st["capture"])
+                walk(st.get("steps"))
+    walk(s.get("setup"))
+    walk(s.get("steps"))
+    return names
 
 
 def validate(data: Any) -> list[str]:
@@ -486,7 +590,18 @@ def validate(data: Any) -> list[str]:
                     p.append(f"{w}.adapter: must be one of {', '.join(ADAPTERS)}{_suggest(str(adapter), ADAPTERS)}")
                 for key in ("setup", "steps"):
                     if key in s:
-                        validate_steps(s[key], f"{w}.{key}", adapter, p)
+                        validate_steps(s[key], f"{w}.{key}", adapter, p, kind)
+                if "screenshotTimeout" in s and not (_num(s["screenshotTimeout"]) and s["screenshotTimeout"] > 0):
+                    p.append(f"{w}.screenshotTimeout: must be a positive number of milliseconds "
+                             f"(default: the shot's timeout, else 120000)")
+                if "frameStep" in s:
+                    if adapter != "strata-kit":
+                        p.append(f"{w}.frameStep: only the strata-kit adapter drives a clock")
+                    elif not (_num(s["frameStep"]) and s["frameStep"] > 0):
+                        p.append(f"{w}.frameStep: must be a positive number of seconds per frame (default 1/30)")
+                if kind == "still" and "each" in s and _named_captures(s):
+                    p.append(f"{w}.each: named captures and 'each' don't mix; make one shot per value "
+                             f"or drop the names")
                 css = s.get("css")
                 if css is not None and not isinstance(css, str):
                     p.append(f"{w}.css: must be a string of CSS")
@@ -559,11 +674,46 @@ def validate(data: Any) -> list[str]:
             _check_keys(gif, GIF_KEYS, f"{w}.gif", p)
             if gif.get("palette", "adaptive") not in PALETTES:
                 p.append(f"{w}.gif.palette: must be one of {', '.join(PALETTES)}")
+            if "hold_last_ms" in gif and not (_num(gif["hold_last_ms"]) and gif["hold_last_ms"] >= 0):
+                p.append(f"{w}.gif.hold_last_ms: must be milliseconds to show the last frame (e.g. 1500)")
+            if "every" in gif and not _every_ok(gif["every"]):
+                p.append(f"{w}.gif.every: must be a positive integer (keep every Nth captured frame)")
         video = s.get("video", [])
+        if isinstance(video, dict):
+            _check_keys(video, VIDEO_KEYS, f"{w}.video", p)
+            if "hold_last" in video and not (_num(video["hold_last"]) and video["hold_last"] >= 0):
+                p.append(f"{w}.video.hold_last: must be seconds to hold the last frame (e.g. 1.5)")
+            if "every" in video and not _every_ok(video["every"]):
+                p.append(f"{w}.video.every: must be a positive integer (keep every Nth captured frame)")
+            video = video.get("formats", [])
         if isinstance(video, str):
             video = [video]
         if not isinstance(video, list) or any(v not in VIDEO_FORMATS for v in video):
-            p.append(f"{w}.video: must be a list drawn from {list(VIDEO_FORMATS)}")
+            p.append(f"{w}.video: must be a list drawn from {list(VIDEO_FORMATS)} "
+                     f"(or {{\"formats\": [...], \"every\", \"hold_last\"}})")
+        if "every" in s:
+            if not _every_ok(s["every"]):
+                p.append(f"{w}.every: must be a positive integer (keep every Nth captured frame)")
+            elif kind != "clip":
+                p.append(f"{w}.every: only clips have frames to subsample")
+        if "colors" in s:
+            if not (isinstance(s["colors"], int) and not isinstance(s["colors"], bool) and 2 <= s["colors"] <= 256):
+                p.append(f"{w}.colors: must be an integer from 2 to 256 (PNG colours)")
+            elif kind == "clip":
+                p.append(f"{w}.colors: is for PNG stills; a clip's GIF takes gif.colors")
+            elif still_ext(s) != "png":
+                p.append(f"{w}.colors: only PNG stills are quantized; set \"format\": \"png\" (or a .png file)")
+        gal = s.get("gallery")
+        if gal is not None:
+            if not isinstance(gal, dict):
+                p.append(f"{w}.gallery: must be an object like {{\"width\": 480, \"poster\": true}}")
+            else:
+                _check_keys(gal, GALLERY_KEYS, f"{w}.gallery", p)
+                gw = gal.get("width")
+                if "width" in gal and not (isinstance(gw, int) and not isinstance(gw, bool) and gw > 0):
+                    p.append(f"{w}.gallery.width: must be a positive integer (display width in pixels)")
+                if "poster" in gal and not isinstance(gal["poster"], bool):
+                    p.append(f"{w}.gallery.poster: must be true or false")
         if kind != "clip":
             for k in ("gif", "video", "sheet"):
                 if k in s and s[k] and kind == "still":

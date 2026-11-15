@@ -9,6 +9,7 @@ import shutil
 import time
 from pathlib import Path
 
+from . import __version__
 from . import encode as enc
 from .backends import command as command_backend
 from .backends import web as web_backend
@@ -51,6 +52,28 @@ def take_dir(m: Manifest, key: str) -> Path:
     return m.state_dir / "takes" / key
 
 
+# State written by these versions is recognised (their whole-shot hash) instead of reshooting.
+LEGACY_VERSIONS = ("0.2.0", "0.1.0")
+
+
+def take_capture_hash(m: Manifest, key: str) -> str | None:
+    """The capture hash recorded in a saved take's meta.json (None for no take, or one from 0.2)."""
+    try:
+        return json.loads((take_dir(m, key) / "meta.json").read_text()).get("capture_hash")
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _stamp_take(m: Manifest, key: str, cap_h: str) -> None:
+    path = take_dir(m, key) / "meta.json"
+    try:
+        meta = json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return
+    meta["capture_hash"] = cap_h
+    path.write_text(json.dumps(meta, indent=2))
+
+
 def output_base(m: Manifest, shot: Shot, tag: str | None, variables: dict | None = None) -> Path:
     """Where a shot's outputs go, without the suffix: ``<out>/<name>[.<tag>]``, or the shot's
     ``file`` (relative to the manifest; its extension stripped) with the tag before the extension."""
@@ -59,6 +82,8 @@ def output_base(m: Manifest, shot: Shot, tag: str | None, variables: dict | None
         return m.out_dir / base_name(shot, tag)
     p = m.dir / template(f, {**m.vars, "name": shot.name, "tag": tag or "", **(variables or {})})
     stem = p.parent / p.name[: len(p.name) - len(p.suffix)] if p.suffix else p
+    if m.out_override is not None:  # shoot --out: review copies, never the real files
+        stem = m.out_dir / stem.name
     return stem.parent / (stem.name + (f".{tag}" if tag else ""))
 
 
@@ -94,6 +119,8 @@ def capture_take(m: Manifest, shot: Shot, tag: str | None, retries: int, log=say
                 result = BACKENDS[shot.backend](shot, device, variables, frames_dir, log=log)
             if not result["frames"]:
                 raise CaptureError("no frames captured")
+            for warning in result.get("warnings") or []:
+                log(f"  {key}: {warning}")
             errs = result.get("consoleErrors") or []
             for e in errs[:5]:
                 log(f"  {key}: page error: {e[:200]}")
@@ -104,9 +131,12 @@ def capture_take(m: Manifest, shot: Shot, tag: str | None, retries: int, log=say
                     "device": device, "frames": [Path(f).name for f in result["frames"]],
                     "runs": result.get("runs") or [0] * len(result["frames"]),
                     "consoleErrors": errs, "seconds": round(time.monotonic() - t0, 1),
-                    "attempt": attempt, "when": _dt.datetime.now().isoformat(timespec="seconds")}
+                    "attempt": attempt, "when": _dt.datetime.now().isoformat(timespec="seconds"),
+                    "darkroom": __version__, "capture_hash": m.capture_hash(shot, tag)}
             if any(result.get("captions") or []):
                 meta["captions"] = result["captions"]
+            if any(result.get("names") or []):
+                meta["names"] = result["names"]
             (tdir / "meta.json").write_text(json.dumps(meta, indent=2))
             return meta
         except (CaptureError, OSError, ValueError) as e:
@@ -159,9 +189,19 @@ def encode_take(m: Manifest, shot: Shot, tag: str | None, log=say) -> list[str]:
         return base.parent / (base.name + suffix)
 
     results: list[enc.Result] = []
+    colors = shot.get("colors")
     if shot.kind == "still":
         fmt, ext = still_format(shot)
-        if shot.get("each"):
+        names = meta.get("names") or []
+        if any(names):
+            # Named captures: one still per name, beside the shot's other outputs.
+            suffix = f".{tag}" if tag else ""
+            for k, name in enumerate(names):
+                if name:
+                    results.append(enc.encode_still(frames[k], base.parent / f"{name}{suffix}{ext}",
+                                                    budgets["still_kb"], fmt, shot.get("quality", 86),
+                                                    shot.get("width"), colors))
+        elif shot.get("each"):
             # One still per value: the last frame of each run.
             values = shot["each"]
             templated = any(t in (shot.get("file") or "") for t in ("{value}", "{i}"))
@@ -173,29 +213,33 @@ def encode_take(m: Manifest, shot: Shot, tag: str | None, log=say) -> list[str]:
                 else:
                     path = at(f"-{slug(value)}{ext}")
                 results.append(enc.encode_still(frames[k], path, budgets["still_kb"], fmt,
-                                                shot.get("quality", 86), shot.get("width")))
+                                                shot.get("quality", 86), shot.get("width"), colors))
         else:
             results.append(enc.encode_still(frames[-1], at(ext), budgets["still_kb"], fmt,
-                                            shot.get("quality", 86), shot.get("width")))
+                                            shot.get("quality", 86), shot.get("width"), colors))
     else:
         gif = shot.get("gif", {})
         fps = float(shot.get("fps", (gif or {}).get("fps", 12))) * float(shot.get("speed", 1))
+        every = shot.get("every", 1)
         if gif is not False:
             g = gif or {}
-            results.append(enc.encode_gif(frames, at(".gif"), g.get("budget_mb", budgets["gif_mb"]),
+            results.append(enc.encode_gif(frames[::g.get("every", every)], at(".gif"),
+                                          g.get("budget_mb", budgets["gif_mb"]),
                                           fps=fps, width=g.get("width", shot.get("width", 640)),
                                           palette=g.get("palette", "adaptive"), colors=g.get("colors", 256),
-                                          dither=g.get("dither", False), loop=g.get("loop", 0)))
-        video = shot.get("video", [])
-        video = [video] if isinstance(video, str) else video
+                                          dither=g.get("dither", False), loop=g.get("loop", 0),
+                                          hold_last_ms=g.get("hold_last_ms", 0)))
+        vopts = video_options(shot)
+        video = vopts["formats"]
         for fmt in video:
-            r = enc.encode_video(frames, at(f".{fmt}"), fmt, budgets[f"{fmt}_kb"], fps=fps,
-                                 width=shot.get("width"))
+            r = enc.encode_video(frames[::vopts.get("every", every)], at(f".{fmt}"), fmt, budgets[f"{fmt}_kb"],
+                                 fps=fps, width=shot.get("width"), hold_last=vopts.get("hold_last", 0))
             if r is None:
                 log(f"  {key}: skipped {fmt}: no ffmpeg (install ffmpeg, or pip install 'darkroom[video]')")
             else:
                 results.append(r)
-        poster = shot.get("poster", 0.6 if video else None)
+        gallery_poster = isinstance(shot.get("gallery"), dict) and shot["gallery"].get("poster")
+        poster = shot.get("poster", 0.6 if video or gallery_poster else None)
         if poster is not None and poster is not False:
             i = poster if isinstance(poster, int) and not isinstance(poster, bool) else round(float(poster) * (len(frames) - 1))
             i = max(0, min(len(frames) - 1, i))
@@ -211,6 +255,17 @@ def encode_take(m: Manifest, shot: Shot, tag: str | None, log=say) -> list[str]:
     for r in results:
         log(f"  {r.describe()}")
     return [_rel(m, r.path) for r in results]
+
+
+def video_options(shot: Shot) -> dict:
+    """``video`` as ``{"formats": [...], "every"?, "hold_last"?}`` (it may be a list or a string)."""
+    v = shot.get("video", [])
+    if isinstance(v, dict):
+        out = dict(v)
+        f = out.get("formats", [])
+        out["formats"] = [f] if isinstance(f, str) else list(f)
+        return out
+    return {"formats": [v] if isinstance(v, str) else list(v)}
 
 
 def make_pair(m: Manifest, shot: Shot, log=say) -> list[str]:
@@ -233,7 +288,7 @@ def make_pair(m: Manifest, shot: Shot, log=say) -> list[str]:
     fmt, ext = still_format(shot)
     base = output_base(m, shot, None)
     r = enc.encode_still(combo, base.parent / (base.name + ext), m.budgets(shot)["still_kb"], fmt,
-                         shot.get("quality", 88), shot.get("width"))
+                         shot.get("quality", 88), shot.get("width"), shot.get("colors"))
     log(f"  {r.describe()}")
     return [_rel(m, r.path)]
 
@@ -287,7 +342,7 @@ def make_grid(m: Manifest, shot: Shot, log=say) -> list[str]:
     fmt, ext = still_format(shot)
     base = output_base(m, shot, None)
     r = enc.encode_still(combo, base.parent / (base.name + ext), m.budgets(shot)["still_kb"], fmt,
-                         shot.get("quality", 88), shot.get("width"))
+                         shot.get("quality", 88), shot.get("width"), shot.get("colors"))
     log(f"  {r.describe()}")
     return [_rel(m, r.path)]
 
@@ -309,26 +364,42 @@ def shoot(m: Manifest, only=None, tag=None, retries=None, force=False, encode_on
         if shot.composite and tag:
             continue
         key = base_name(shot, tag)
-        h = m.shot_hash(shot, tag)
-        prev = state.get(key)
-        if (not shot.composite and not force and not encode_only and prev and prev.get("hash") == h
-                and all((m.dir / o).exists() for o in prev.get("outputs", []))):
-            log(f"= {key}: up to date (use --force to reshoot)")
-            continue
-        log(f"> {key} ({shot.kind}{'' if shot.composite else ', ' + shot.backend})")
+        # A review shoot (--out) keeps its own record, so the real outputs' entry is untouched.
+        skey = key if m.out_override is None else f"{key}@{m.out_dir}"
+        cap_h, enc_h = m.capture_hash(shot, tag), m.encode_hash(shot, tag)
+        prev = state.get(skey) or {}
+        outputs_ok = bool(prev) and all((m.dir / o).exists() for o in prev.get("outputs", []))
+        reencode = False
+        if not shot.composite and not force and not encode_only:
+            take = take_capture_hash(m, key)
+            if take is None and prev.get("hash") and "capture_hash" not in prev and outputs_ok and any(
+                    prev["hash"] == m.legacy_hash(shot, tag, v) for v in LEGACY_VERSIONS):
+                # State from darkroom 0.1/0.2 for this exact shot: adopt it instead of reshooting.
+                state.put(skey, dict(prev, capture_hash=cap_h, encode_hash=enc_h, darkroom=__version__))
+                _stamp_take(m, key, cap_h)
+                log(f"= {key}: up to date (use --force to reshoot)")
+                continue
+            if take == cap_h:
+                if prev.get("encode_hash") == enc_h and outputs_ok:
+                    log(f"= {key}: up to date (use --force to reshoot)")
+                    continue
+                reencode = True
+        log(f"> {key} ({shot.kind}{'' if shot.composite else ', ' + shot.backend})"
+            + (": capture unchanged, re-encoding the saved take" if reencode else ""))
         try:
             if shot.kind == "pair":
                 outputs = make_pair(m, shot, log)
             elif shot.kind == "grid":
                 outputs = make_grid(m, shot, log)
             else:
-                if not encode_only:
+                if not (encode_only or reencode):
                     capture_take(m, shot, tag, shot.get("retries", 2) if retries is None else retries, log)
                 elif not (take_dir(m, key) / "meta.json").exists():
                     raise CaptureError(f"{key}: no saved take to re-encode; shoot it first")
                 outputs = encode_take(m, shot, tag, log)
-            state.put(key, {"hash": h, "outputs": outputs, "tag": tag,
-                            "when": _dt.datetime.now().isoformat(timespec="seconds")})
+            state.put(skey, {"hash": m.shot_hash(shot, tag), "capture_hash": cap_h, "encode_hash": enc_h,
+                             "outputs": outputs, "tag": tag, "darkroom": __version__,
+                             "when": _dt.datetime.now().isoformat(timespec="seconds")})
         except Exception as e:  # one failing shot doesn't stop the others
             failed += 1
             log(f"! {key}: FAILED: {str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__}")

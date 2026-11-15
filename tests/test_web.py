@@ -14,7 +14,10 @@ from darkroom.shoot import shoot
 
 PAGE = """<!doctype html><html><body style="margin:0;background:#000">
 <canvas id="c" width="320" height="180"></canvas><div id="hud">HUD</div>
+<button id="btn" style="position:absolute;left:200px;top:120px;width:60px;height:30px">go</button>
 <script>
+const tapped = () => { window.tapped = (window.tapped || 0) + 1; };
+document.getElementById('btn').addEventListener('click', tapped);
 const c = document.getElementById('c').getContext('2d');
 const cam = { yaw: 0, pitch: 0, dist: 5, tx: 0, ty: 0, tz: 0 };
 function draw(t) {
@@ -67,3 +70,33 @@ def test_each_runs_a_fresh_page_per_value(server, write_manifest):
     assert (p.parent / "media/view-a.jpg").exists() and (p.parent / "media/view-b.jpg").exists()
     meta = json.loads((p.parent / ".darkroom/takes/view/meta.json").read_text())
     assert meta["runs"] == [0, 1] and meta["captions"] == ["a", "b"]
+
+
+@pytest.mark.skipif(not playwright_available(), reason="Node Playwright not resolvable (set NODE_PATH)")
+def test_steps_added_in_0_3(server, write_manifest):
+    """tap on a selector (touch), frames with a step, until/then, goto, reload, named stills;
+    and a waitFor that never holds fails the shot instead of passing at once."""
+    touch = {"width": 320, "height": 180, "touch": True, "mobile": True}
+    p = write_manifest({"vars": {"base": server}, "shots": [
+        {"name": "tour", "kind": "still", "adapter": "strata-kit", "url": "{base}index.html",
+         "device": touch, "retries": 0, "frameStep": 0.05, "steps": [
+             {"tap": "#btn"}, {"waitFor": "window.tapped === 1", "timeout": 10000},
+             {"frames": 3, "step": 0.1}, {"frames": 2},
+             {"waitFor": "Math.abs(window.lastT - 1.4) < 1e-9", "timeout": 5000},
+             {"until": "window.k >= 3", "max": 10, "then": 2, "steps": [{"js": "window.k = (window.k || 0) + 1"}]},
+             {"waitFor": "window.k === 5", "timeout": 5000},
+             {"capture": "tour-first"},
+             {"goto": "{base}index.html?second=1"},
+             {"js": "window.k = 9"},
+             {"reload": True},
+             {"waitFor": "location.search === '?second=1' && window.k === undefined", "timeout": 5000},
+             {"capture": "tour-second"}]},
+        {"name": "never", "kind": "still", "url": "{base}index.html", "retries": 0,
+         "device": {"width": 160, "height": 90}, "steps": [{"waitFor": "false", "timeout": 1500}]}]})
+    logs = []
+    assert shoot(load(p), log=logs.append) == 1
+    assert any("never: FAILED" in l for l in logs) and not any("tour: FAILED" in l for l in logs), logs
+    assert (p.parent / "media/tour-first.jpg").exists() and (p.parent / "media/tour-second.jpg").exists()
+    assert not (p.parent / "media/tour.jpg").exists()
+    meta = json.loads((p.parent / ".darkroom/takes/tour/meta.json").read_text())
+    assert meta["names"] == ["tour-first", "tour-second"]
