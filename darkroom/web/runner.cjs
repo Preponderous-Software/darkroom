@@ -47,6 +47,104 @@ async function waitTrue(page, code, scope, timeout, what) {
 }
 
 const now = () => new Date().toISOString();
+
+// The paced clock (clock.engine "darkroom"), installed as an init script before the page's own
+// scripts. setTimeout, setInterval, requestAnimationFrame, performance.now, Date.now and
+// `new Date()` all read one clock. Until freeze() it follows real time (timers are real timers,
+// tracked); after it, time stands still and only advance(ms) moves it: due timers run in order of
+// their due time, then every pending animation frame runs once, with the new time.
+function installClock(cfg) {
+  const W = window;
+  if (W.__darkroomClock) return;
+  const real = {
+    setTimeout: W.setTimeout.bind(W), clearTimeout: W.clearTimeout.bind(W),
+    raf: W.requestAnimationFrame.bind(W), now: performance.now.bind(performance), Date: W.Date,
+  };
+  const RD = real.Date;
+  const dateBase = RD.now() - real.now();
+  let frozen = false, vt = 0, nextId = 1, seq = 0, rafs = new Map();
+  const timers = new Map();
+  const nowV = () => (frozen ? vt : real.now());
+  const report = (e) => { if (W.reportError) W.reportError(e); else real.setTimeout(() => { throw e; }, 0); };
+  const call = (fn, args) => { try { fn.apply(W, args); } catch (e) { report(e); } };
+  const arm = (t) => { t.real = real.setTimeout(() => fire(t.id), Math.max(0, t.due - real.now())); };
+  function fire(id) {
+    const t = timers.get(id);
+    if (!t) return;
+    if (t.every == null) timers.delete(id);
+    else { t.due = Math.max(t.due + t.every, frozen ? 0 : real.now()); t.seq = ++seq; if (!frozen) arm(t); }
+    call(t.fn, t.args);
+  }
+  function add(fn, delay, args, repeat) {
+    if (typeof fn !== "function") { const code = String(fn); fn = () => (0, eval)(code); }
+    const d = Math.max(0, Number(delay) || 0);
+    const t = { id: nextId++, fn, args, due: nowV() + d, every: repeat ? Math.max(1, d) : null, seq: ++seq, real: null };
+    timers.set(t.id, t);
+    if (!frozen) arm(t);
+    return t.id;
+  }
+  function clear(id) {
+    const t = timers.get(id);
+    if (!t) return;
+    timers.delete(id);
+    if (t.real != null) real.clearTimeout(t.real);
+  }
+  W.setTimeout = function setTimeout(fn, delay, ...args) { return add(fn, delay, args, false); };
+  W.setInterval = function setInterval(fn, delay, ...args) { return add(fn, delay, args, true); };
+  W.clearTimeout = function clearTimeout(id) { clear(id); };
+  W.clearInterval = function clearInterval(id) { clear(id); };
+  W.requestAnimationFrame = function requestAnimationFrame(cb) {
+    const id = nextId++;
+    rafs.set(id, cb);
+    if (!frozen) real.raf((ts) => { if (!frozen && rafs.delete(id)) call(cb, [ts]); });
+    return id;
+  };
+  W.cancelAnimationFrame = function cancelAnimationFrame(id) { rafs.delete(id); };
+  performance.now = function now() { return nowV(); };
+  const dateNow = () => Math.round(dateBase + nowV());
+  function Date(...a) {
+    if (!new.target) return new RD(dateNow()).toString();
+    return Reflect.construct(RD, a.length ? a : [dateNow()], new.target);
+  }
+  Date.prototype = RD.prototype;
+  Date.now = dateNow;
+  Date.parse = RD.parse;
+  Date.UTC = RD.UTC;
+  W.Date = Date;
+  // A task boundary, so promise callbacks queued by one timer run before the next timer.
+  const yieldTask = () => new Promise((r) => { const ch = new MessageChannel(); ch.port1.onmessage = () => r(); ch.port2.postMessage(0); });
+  function freeze() {
+    if (frozen) return;
+    vt = real.now();
+    frozen = true;
+    for (const t of timers.values()) if (t.real != null) { real.clearTimeout(t.real); t.real = null; }
+  }
+  async function advance(ms) {
+    freeze();
+    const target = vt + ms;
+    for (let guard = 0; ; guard++) {
+      let next = null;
+      for (const t of timers.values()) {
+        if (t.due <= target && (!next || t.due < next.due || (t.due === next.due && t.seq < next.seq))) next = t;
+      }
+      if (!next) break;
+      if (guard > 100000) throw new Error("paced clock: over 100000 timers ran in one step (a zero-delay timer loop?)");
+      vt = Math.max(vt, next.due);
+      fire(next.id);
+      await yieldTask();
+    }
+    vt = target;
+    const due = rafs;
+    rafs = new Map();
+    for (const cb of due.values()) call(cb, [vt]);
+    await yieldTask();
+    return vt;
+  }
+  Object.defineProperty(W, "__darkroomClock", {
+    value: { freeze, advance, get now() { return nowV(); }, get frozen() { return frozen; } },
+  });
+  if (cfg.start === "load") freeze();
+}
 const newResult = () => ({ frames: [], names: [], consoleErrors: [], console: [], marks: {}, error: null, logs: [], warnings: [] });
 
 // Open the browser and the page for a job: context, init scripts, routes, the first navigation
@@ -71,6 +169,16 @@ async function open(job, out) {
     userAgent: job.userAgent || baseUA.replace("HeadlessChrome", "Chrome") + " darkroom-monitor",
   });
   s.context = context;
+  // A paced clock goes in first, so the page's own scripts (and other init scripts) see it.
+  const clock = job.clock && job.clock.mode === "paced" ? job.clock : null;
+  s.clock = clock;
+  if (clock && clock.engine === "playwright") {
+    if (!context.clock) throw new Error("clock.engine 'playwright' needs Playwright 1.45 or newer (page.clock); use engine 'darkroom'");
+    await context.clock.install();
+    if (clock.start === "load") await context.clock.pauseAt(Date.now());
+  } else if (clock) {
+    await context.addInitScript({ content: `(${installClock})(${JSON.stringify(clock)});` });
+  }
   // initScript: runs in every page (and frame) before the page's own scripts, in order.
   for (const content of job.initScripts || []) await context.addInitScript({ content });
   context.setDefaultTimeout(T);
@@ -95,9 +203,30 @@ async function open(job, out) {
   const ready = job.ready || (kit ? "window.__strataKit" : "true");
   // After every navigation: the adapter's ready wait, then the shot's css.
   const afterLoad = async () => {
-    await page.waitForFunction(ready, null, { timeout: job.readyTimeout, polling: 100 });
+    // A paced page's own timers may be stopped, so poll from here rather than in the page.
+    if (clock) await waitTrue(page, ready, {}, job.readyTimeout, "ready");
+    else await page.waitForFunction(ready, null, { timeout: job.readyTimeout, polling: 100 });
     if (job.css) await page.addStyleTag({ content: job.css });
     s.t = 1; // strata-kit clock, seconds
+    if (clock && clock.start !== "load") await freezeClock();
+  };
+  // Stop the paced clock where it is (start "ready"); from here only frames steps move it.
+  const freezeClock = async () => {
+    if (clock.engine === "playwright") {
+      // pauseAt cannot go back, and the page's time flows while this call travels: pause a
+      // little ahead (timers due in the gap run), further ahead if that was still too soon.
+      for (const ahead of [20, 100, 500, 2000]) {
+        try { await page.clock.pauseAt((await page.evaluate(() => Date.now())) + ahead); return; } catch (e) {
+          if (!/past/.test(String(e)) || ahead === 2000) throw e;
+        }
+      }
+    } else await page.evaluate(() => window.__darkroomClock.freeze());
+  };
+  // Step the paced clock n times by `step` seconds: due timers, then one round of animation frames.
+  const pace = async (n, step) => {
+    const ms = (step || clock.step) * 1000;
+    if (clock.engine === "playwright") { for (let i = 0; i < n; i++) await page.clock.runFor(ms); return; }
+    await page.evaluate(async ({ n, ms }) => { for (let i = 0; i < n; i++) await window.__darkroomClock.advance(ms); }, { n, ms });
   };
   await page.goto(job.url, { waitUntil: job.waitUntil || "load", timeout: job.readyTimeout });
   await afterLoad();
@@ -135,15 +264,40 @@ async function open(job, out) {
       if (same >= STABLE_POLLS) return;
       last = key;
       if (Date.now() - t0 > timeout) throw new Error(`stable: '${sel}' was still moving (or had no box) after ${timeout} ms`);
-      await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => r())));
+      // A paced page's animation frames wait for frames steps: poll on wall-clock time instead.
+      if (clock) await page.waitForTimeout(50);
+      else await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => r())));
     }
+  };
+
+  // The pointer's last position, for relative moves ({"mouse": "move", "by": [dx, dy]}).
+  s.mouse = [0, 0];
+  const moveTo = async (p, steps) => { await page.mouse.move(p[0], p[1], { steps: steps || 1 }); s.mouse = [p[0], p[1]]; };
+
+  // A crop measured from an element ({"of": css, "pad": px}), clamped to the viewport.
+  const measureCrop = async (crop) => {
+    const el = page.locator(crop.of).first();
+    await el.waitFor({ state: "visible", timeout: T });
+    const box = await el.boundingBox();
+    if (!box) throw new Error(`crop: '${crop.of}' has no box on the page`);
+    const pad = crop.pad || 0, vp = page.viewportSize() || { width: dev.width, height: dev.height };
+    const x0 = Math.max(0, Math.floor(box.x - pad)), y0 = Math.max(0, Math.floor(box.y - pad));
+    const x1 = Math.min(vp.width, Math.ceil(box.x + box.width + pad)), y1 = Math.min(vp.height, Math.ceil(box.y + box.height + pad));
+    if (x1 <= x0 || y1 <= y0) throw new Error(`crop: '${crop.of}' (plus pad ${pad}) is outside the ${vp.width}x${vp.height} viewport`);
+    return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
   };
 
   // One shot on this page: its steps, then (for a still) the final frame. Fills `out`.
   s.shot = async (shotJob, out) => {
     s.out = out;
-    const clip = shotJob.crop ? { x: shotJob.crop[0], y: shotJob.crop[1], width: shotJob.crop[2], height: shotJob.crop[3] } : undefined;
+    const crop = shotJob.crop;
+    // A measured crop is taken at the shot's first capture and kept, so every frame is one size.
+    let clip = Array.isArray(crop) ? { x: crop[0], y: crop[1], width: crop[2], height: crop[3] } : undefined;
     const capture = async (name) => {
+      if (crop && !Array.isArray(crop) && !clip) {
+        clip = await measureCrop(crop);
+        out.crop = { of: crop.of, pad: crop.pad || 0, rect: [clip.x, clip.y, clip.width, clip.height] };
+      }
       const file = path.join(shotJob.framesDir, String(out.frames.length).padStart(5, "0") + ".png");
       await page.screenshot({ path: file, clip, animations: "allow", caret: "initial", timeout: T });
       out.frames.push(file);
@@ -166,11 +320,27 @@ async function open(job, out) {
         } else if ("click" in st) {
           if (typeof st.click === "string") await page.click(st.click, { timeout: T, force: !!st.force });
           else { const [x, y] = await pointOf(st.click, st.force, "click"); await page.mouse.click(x, y); }
+        } else if ("mouse" in st) {
+          if (st.at !== undefined) await moveTo(await pointOf(st.at, st.force, "mouse"), st.steps);
+          else if (st.by) await moveTo([s.mouse[0] + st.by[0], s.mouse[1] + st.by[1]], st.steps);
+          if (st.mouse === "down") await page.mouse.down({ button: st.button || "left" });
+          else if (st.mouse === "up") await page.mouse.up({ button: st.button || "left" });
+        } else if ("drag" in st) {
+          const d = st.drag, button = d.button || "left";
+          const from = await pointOf(d.from, st.force, "drag.from");
+          await moveTo(from);
+          await page.mouse.down({ button });
+          await moveTo(await pointOf(d.to, st.force, "drag.to"), d.steps || 10);
+          await page.mouse.up({ button });
+        } else if ("wheel" in st) {
+          if (st.at !== undefined) await moveTo(await pointOf(st.at, st.force, "wheel"));
+          await page.mouse.wheel(st.wheel.dx || 0, st.wheel.dy || 0);
         } else if ("stable" in st) await stable(st.stable, st.timeout || 30000);
         else if ("wait" in st) await page.waitForTimeout(st.wait);
         else if ("waitFor" in st) await waitTrue(page, st.waitFor, scope, st.timeout || 30000, "waitFor");
         else if ("frames" in st) {
           if (kit) await drive(st.frames, st.step);
+          else if (clock) await pace(st.frames, st.step);
           else for (let i = 0; i < st.frames; i++) await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => r())));
         } else if ("camera" in st) await page.evaluate((c) => Object.assign(window.__strataKit.cam, c), st.camera);
         else if ("css" in st) await page.addStyleTag({ content: st.css });

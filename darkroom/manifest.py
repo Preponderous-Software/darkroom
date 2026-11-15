@@ -43,7 +43,8 @@ COMMON_SHOT_KEYS = {
 }
 WEB_KEYS = {"url", "adapter", "ready", "readyTimeout", "css", "setup", "steps",
             "failOnConsoleError", "waitUntil", "launchArgs", "crop", "userAgent", "block", "each",
-            "screenshotTimeout", "frameStep", "initScript", "context", "failOnConsole", "session"}
+            "screenshotTimeout", "frameStep", "initScript", "context", "failOnConsole", "session",
+            "clock"}
 COMMAND_KEYS = {"argv", "env", "cwd", "xvfb", "repeat", "glob", "each", "outputs"}
 # A prep runs a command that writes files (no images): only these keys apply.
 PREP_KEYS = {"name", "kind", "backend", "comment", "skip", "lock", "lockTimeout", "timeout", "retries", "inputs",
@@ -75,7 +76,7 @@ CONSOLE_TYPES = ("error", "warning", "info", "log", "debug", "pageerror", "asser
 # Fields every shot of one web `session` shares: the page is opened (and `setup` run) once, with
 # the first shot's values.
 SESSION_FIELDS = ("url", "adapter", "ready", "readyTimeout", "waitUntil", "css", "setup", "device",
-                  "userAgent", "block", "launchArgs", "initScript", "context", "frameStep", "lock")
+                  "userAgent", "block", "launchArgs", "initScript", "context", "frameStep", "clock", "lock")
 CAPTURE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 DEVICE_KEYS = {"width", "height", "dpr", "touch", "mobile"}
 
@@ -84,15 +85,25 @@ STEP_KEYS = {
     "waitFor": {"timeout"}, "frames": {"step"}, "camera": set(), "capture": set(),
     "repeat": {"steps", "var"}, "css": set(), "type": set(), "mark": set(),
     "until": {"steps", "max", "then", "var"}, "goto": set(), "reload": set(),
-    "stable": {"timeout"},
+    "stable": {"timeout"}, "mouse": {"at", "by", "button", "steps", "force"}, "drag": {"force"},
+    "wheel": {"at", "force"},
 }
+MOUSE_ACTIONS = ("down", "up", "move")
+MOUSE_BUTTONS = ("left", "right", "middle")
+DRAG_KEYS = {"from", "to", "steps", "button"}
+# The paced clock (0.7): page timers advance only when a `frames` step steps them.
+CLOCK_KEYS = {"mode", "step", "start", "engine"}
+CLOCK_MODES = ("paced",)
+CLOCK_STARTS = ("ready", "load")
+CLOCK_ENGINES = ("darkroom", "playwright")
+CROP_KEYS = {"of", "pad"}
 
 # What changes the captured pixels (a reshoot) and what changes only the encoding (re-encode
 # the saved take). Anything else (caption, alt, gallery, retries, lock, timeouts, comment,
 # skip, failOnConsoleError) changes neither, so editing it never marks a shot stale.
 CAPTURE_FIELDS = {"kind", "backend", "device", "url", "adapter", "ready", "waitUntil", "css", "setup",
                   "steps", "crop", "userAgent", "block", "launchArgs", "each", "frameStep",
-                  "argv", "env", "cwd", "xvfb", "repeat", "glob", "initScript", "context"}
+                  "argv", "env", "cwd", "xvfb", "repeat", "glob", "initScript", "context", "clock"}
 ENCODE_FIELDS = {"format", "quality", "width", "gif", "video", "poster", "sheet", "aspect", "speed",
                  "fps", "file", "every", "colors", "of", "before", "after", "labels", "tiles",
                  "frames", "cols", "title", "captions"}
@@ -478,7 +489,8 @@ def _num(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
-def validate_steps(steps, where: str, adapter: str, problems: list[str], kind: str = "clip"):
+def validate_steps(steps, where: str, adapter: str, problems: list[str], kind: str = "clip",
+                   paced: bool = False):
     if not isinstance(steps, list):
         problems.append(f"{where}: must be a list of steps")
         return
@@ -549,7 +561,7 @@ def validate_steps(steps, where: str, adapter: str, problems: list[str], kind: s
         elif verb == "repeat":
             if not (isinstance(v, int) and v >= 0):
                 problems.append(f"{w}.repeat: must be a non-negative integer")
-            validate_steps(st.get("steps", []), f"{w}.steps", adapter, problems, kind)
+            validate_steps(st.get("steps", []), f"{w}.steps", adapter, problems, kind, paced)
         elif verb == "until":
             if not (isinstance(v, str) and v.strip()):
                 problems.append(f"{w}.until: must be a JS expression; the steps repeat until it is truthy")
@@ -561,16 +573,133 @@ def validate_steps(steps, where: str, adapter: str, problems: list[str], kind: s
                 problems.append(f"{w}.then: must be a non-negative integer (passes to run after the condition holds)")
             if "steps" not in st:
                 problems.append(f"{w}.steps: required, the steps to repeat")
-            validate_steps(st.get("steps", []), f"{w}.steps", adapter, problems, kind)
+            validate_steps(st.get("steps", []), f"{w}.steps", adapter, problems, kind, paced)
         if "force" in st and not isinstance(st["force"], bool):
             problems.append(f"{w}.force: must be true or false (true skips Playwright's actionability checks)")
         if verb == "stable" and "timeout" in st and not (_num(st["timeout"]) and st["timeout"] > 0):
             problems.append(f"{w}.timeout: must be a positive number of milliseconds")
+        if verb in ("mouse", "drag", "wheel"):
+            _validate_pointer_step(st, verb, w, problems)
         if verb == "frames" and "step" in st:
-            if adapter != "strata-kit":
-                problems.append(f"{w}.step: only the strata-kit adapter drives a clock; drop 'step'")
+            if adapter != "strata-kit" and not paced:
+                problems.append(f"{w}.step: only the strata-kit adapter or a paced clock "
+                                f"(\"clock\": {{\"mode\": \"paced\"}}) steps game time; drop 'step'")
             elif not (_num(st["step"]) and st["step"] > 0):
                 problems.append(f"{w}.step: must be a positive number of seconds per frame (e.g. 0.1)")
+
+
+_POINT_FORMS = ("[x, y] in CSS pixels, a CSS selector (its centre), or {\"at\": [fx, fy], \"of\": \"css\"} "
+                "(fractions of the element's box)")
+
+
+def _point_problem(v, where: str) -> str | None:
+    """A pointer position as tap takes it: [x, y], a selector, or {"at": [fx, fy], "of": css}."""
+    if isinstance(v, list):
+        if len(v) == 2 and all(_num(x) for x in v):
+            return None
+    elif isinstance(v, str):
+        if v.strip():
+            return None
+    elif isinstance(v, dict):
+        extra = set(v) - {"at", "of"}
+        at, of = v.get("at"), v.get("of")
+        if extra:
+            return f"{where}: unknown key '{sorted(extra)[0]}'; a position is {_POINT_FORMS}"
+        if not (isinstance(at, list) and len(at) == 2 and all(_num(x) and 0 <= x <= 1 for x in at)):
+            return f"{where}.at: must be [fx, fy], fractions (0 to 1) of the element's box ([0.5, 0.5] is its centre)"
+        if not (isinstance(of, str) and of.strip()):
+            return f"{where}.of: required, a CSS selector for the element whose box 'at' is in"
+        return None
+    return f"{where}: must be {_POINT_FORMS}"
+
+
+def _validate_pointer_step(st: dict, verb: str, w: str, problems: list[str]) -> None:
+    """mouse, drag and wheel steps (0.7)."""
+    def button(v, where):
+        if v not in MOUSE_BUTTONS:
+            problems.append(f"{where}: must be one of {', '.join(MOUSE_BUTTONS)}")
+
+    def steps_ok(v, where):
+        if not (isinstance(v, int) and not isinstance(v, bool) and v >= 1):
+            problems.append(f"{where}: must be a positive integer (pointer moves between the two points)")
+
+    def by_ok(v, where):
+        if not (isinstance(v, list) and len(v) == 2 and all(_num(x) for x in v)):
+            problems.append(f"{where}: must be [dx, dy] in CSS pixels, relative to the pointer's last position")
+
+    v = st[verb]
+    if verb == "mouse":
+        if v not in MOUSE_ACTIONS:
+            problems.append(f"{w}.mouse: must be down, up or move")
+        if "at" in st and "by" in st:
+            problems.append(f"{w}: give 'at' (a position) or 'by' (a relative move), not both")
+        if v == "move" and "at" not in st and "by" not in st:
+            problems.append(f"{w}: a move needs 'at' (a position) or 'by' ([dx, dy] from the last position)")
+        if "at" in st:
+            msg = _point_problem(st["at"], f"{w}.at")
+            if msg:
+                problems.append(msg)
+        if "by" in st:
+            by_ok(st["by"], f"{w}.by")
+        if "button" in st:
+            if v == "move":
+                problems.append(f"{w}.button: a move presses no button; put it on the down and up steps")
+            else:
+                button(st["button"], f"{w}.button")
+        if "steps" in st:
+            steps_ok(st["steps"], f"{w}.steps")
+    elif verb == "drag":
+        if not isinstance(v, dict):
+            problems.append(f"{w}.drag: must be an object {{\"from\": position, \"to\": position, \"steps\": 10, "
+                            f"\"button\": \"left\"}}")
+            return
+        _check_keys(v, DRAG_KEYS, f"{w}.drag", problems)
+        for end in ("from", "to"):
+            if end not in v:
+                problems.append(f"{w}.drag.{end}: required, {_POINT_FORMS}")
+            else:
+                msg = _point_problem(v[end], f"{w}.drag.{end}")
+                if msg:
+                    problems.append(msg)
+        if "steps" in v:
+            steps_ok(v["steps"], f"{w}.drag.steps")
+        if "button" in v:
+            button(v["button"], f"{w}.drag.button")
+    elif verb == "wheel":
+        if not isinstance(v, dict) or not v:
+            problems.append(f"{w}.wheel: must be {{\"dx\": 0, \"dy\": -120}} in CSS pixels (negative dy scrolls up "
+                            f"or zooms in)")
+            return
+        _check_keys(v, {"dx", "dy"}, f"{w}.wheel", problems)
+        for k in ("dx", "dy"):
+            if k in v and not _num(v[k]):
+                problems.append(f"{w}.wheel.{k}: must be a number of CSS pixels")
+        if "at" in st:
+            msg = _point_problem(st["at"], f"{w}.at")
+            if msg:
+                problems.append(msg)
+
+
+def _validate_clock(s: dict, w: str, adapter: str, p: list[str]) -> bool:
+    """The shot's ``clock``; True when it is a paced clock."""
+    c = s["clock"]
+    if not isinstance(c, dict):
+        p.append(f"{w}.clock: must be an object like {{\"mode\": \"paced\", \"step\": 0.05}}")
+        return False
+    _check_keys(c, CLOCK_KEYS, f"{w}.clock", p)
+    if c.get("mode") not in CLOCK_MODES:
+        p.append(f"{w}.clock.mode: required, 'paced' (page timers advance only with frames steps)")
+    if "step" in c and not (_num(c["step"]) and c["step"] > 0):
+        p.append(f"{w}.clock.step: must be a positive number of seconds of page time per frame (default 1/30)")
+    if "start" in c and c["start"] not in CLOCK_STARTS:
+        p.append(f"{w}.clock.start: must be 'ready' (the clock runs until the page is ready, then waits for frames "
+                 f"steps) or 'load' (paced from the first script)")
+    if "engine" in c and c["engine"] not in CLOCK_ENGINES:
+        p.append(f"{w}.clock.engine: must be 'darkroom' (one animation frame per step) or 'playwright' "
+                 f"(Playwright's page.clock)")
+    if adapter == "strata-kit":
+        p.append(f"{w}.clock: the strata-kit adapter already drives the game's clock (frameStep); drop 'clock'")
+    return c.get("mode") == "paced"
 
 
 def _validate_grid(s: dict, w: str, all_names: set, composites: dict, p: list[str]) -> None:
@@ -768,9 +897,10 @@ def validate(data: Any) -> list[str]:
                 adapter = s.get("adapter", "hook")
                 if adapter not in ADAPTERS:
                     p.append(f"{w}.adapter: must be one of {', '.join(ADAPTERS)}{_suggest(str(adapter), ADAPTERS)}")
+                paced = _validate_clock(s, w, adapter, p) if "clock" in s else False
                 for key in ("setup", "steps"):
                     if key in s:
-                        validate_steps(s[key], f"{w}.{key}", adapter, p, kind)
+                        validate_steps(s[key], f"{w}.{key}", adapter, p, kind, paced)
                 if "screenshotTimeout" in s and not (_num(s["screenshotTimeout"]) and s["screenshotTimeout"] > 0):
                     p.append(f"{w}.screenshotTimeout: must be a positive number of milliseconds "
                              f"(default: the shot's timeout, else 120000)")
@@ -911,8 +1041,18 @@ def validate(data: Any) -> list[str]:
                 if k in s and s[k] and kind == "still":
                     p.append(f"{w}.{k}: only clips have {k} output")
         crop = s.get("crop")
-        if crop is not None and not (isinstance(crop, list) and len(crop) == 4 and all(_num(x) for x in crop)):
-            p.append(f"{w}.crop: must be [x, y, width, height] in CSS pixels")
+        if isinstance(crop, dict):
+            _check_keys(crop, CROP_KEYS, f"{w}.crop", p)
+            if not (isinstance(crop.get("of"), str) and crop["of"].strip()):
+                p.append(f"{w}.crop.of: required, a CSS selector; its box (measured when the shot is captured) "
+                         f"is the crop")
+            if "pad" in crop and not _num(crop["pad"]):
+                p.append(f"{w}.crop.pad: must be a number of CSS pixels added around the element's box")
+            if s.get("backend", "web") != "web":
+                p.append(f"{w}.crop: only a web shot can measure an element; give [x, y, width, height]")
+        elif crop is not None and not (isinstance(crop, list) and len(crop) == 4 and all(_num(x) for x in crop)):
+            p.append(f"{w}.crop: must be [x, y, width, height] in CSS pixels, or {{\"of\": \"css\", \"pad\": 8}} "
+                     f"(an element's box, measured at capture time)")
         aspect = s.get("aspect")
         if aspect is not None and not (isinstance(aspect, str) and re.fullmatch(r"\d+:\d+", aspect)):
             p.append(f"{w}.aspect: must look like '16:9' or '1:1'")

@@ -236,6 +236,12 @@ def capture_take(m: Manifest, shot: Shot, tag: str | None, retries: int, log=say
                 meta["console"] = counts
             if session is not None:
                 meta["session"] = session.name
+            # A crop measured from an element at capture time: the rectangle used (CSS px),
+            # kept with the take since the frames were cut to it.
+            if result.get("crop"):
+                meta["crop"] = result["crop"]
+            elif result.get("crops"):
+                meta["crops"] = result["crops"]
             if any(result.get("captions") or []):
                 meta["captions"] = result["captions"]
             if any(result.get("names") or []):

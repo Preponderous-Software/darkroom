@@ -108,6 +108,7 @@ def capture(shot, device: dict, variables: dict, frames_dir: Path, log=print, de
     errors: list[str] = []
     console: list[dict] = []
     warnings: list[str] = []
+    crops: list[dict | None] = []
     frames_dir.mkdir(parents=True, exist_ok=True)
     for i, value in enumerate(each):
         sub = frames_dir / f"run-{i}"
@@ -130,8 +131,20 @@ def capture(shot, device: dict, variables: dict, frames_dir: Path, log=print, de
         errors += r.get("consoleErrors") or []
         console += [dict(c, run=i) for c in r.get("console") or []]
         warnings += r.get("warnings") or []
-    return {"frames": frames, "runs": runs, "captions": captions, "consoleErrors": errors,
-            "console": console, "names": names, "warnings": warnings}
+        crops.append(r.get("crop"))
+    out = {"frames": frames, "runs": runs, "captions": captions, "consoleErrors": errors,
+           "console": console, "names": names, "warnings": warnings}
+    if any(crops):
+        out["crops"] = crops
+    return out
+
+
+def clock_job(clock) -> dict | None:
+    """The shot's ``clock`` with its defaults filled in (None: the page's own clock)."""
+    if not clock:
+        return None
+    return {"mode": clock.get("mode", "paced"), "step": float(clock.get("step", 1 / 30)),
+            "start": clock.get("start", "ready"), "engine": clock.get("engine", "darkroom")}
 
 
 def _job(shot, device: dict, variables: dict, frames_dir: Path, project: Path, result_path: str | None) -> dict:
@@ -147,6 +160,7 @@ def _job(shot, device: dict, variables: dict, frames_dir: Path, project: Path, r
         "steps": template_steps(shot.get("steps", []), variables),
         "timeoutMs": action_timeout_ms(shot),
         "frameStep": float(shot.get("frameStep", 1 / 30)),
+        "clock": clock_job(shot.get("clock")),
         "device": device,
         "crop": shot.get("crop"),
         "userAgent": shot.get("userAgent"),
