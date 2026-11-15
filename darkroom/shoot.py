@@ -2,8 +2,10 @@
 and remember what was made so the next run can skip it (resume)."""
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import json
+import os
 import re
 import shutil
 import time
@@ -11,10 +13,11 @@ from pathlib import Path
 
 from . import __version__
 from . import encode as enc
+from . import procs
 from .backends import command as command_backend
 from .backends import web as web_backend
 from .backends.command import CaptureError
-from .locks import lock
+from .locks import LockTimeout, lock, lock_holder
 from .manifest import STILL_EXTS, Manifest, Shot, slug, template
 
 BACKENDS = {"web": web_backend.capture, "command": command_backend.capture}
@@ -30,22 +33,48 @@ def base_name(shot: Shot, tag: str | None) -> str:
 
 
 class State:
+    """``.darkroom/state.json``. Several runs can shoot one manifest at once (``--only A`` and
+    ``--only B``), so every update re-reads the file under an exclusive lock, changes its own
+    entry and writes it back atomically (temp file and rename): no run loses another's entries."""
+
     def __init__(self, m: Manifest):
         self.path = m.state_dir / "state.json"
+        self.data = self._read()
+
+    def _read(self) -> dict:
         try:
-            self.data = json.loads(self.path.read_text())
+            data = json.loads(self.path.read_text())
+            return data if isinstance(data, dict) else {}
         except (FileNotFoundError, json.JSONDecodeError):
-            self.data = {}
+            return {}
 
     def get(self, key):
         return self.data.get(key)
 
     def put(self, key, entry):
-        self.data[key] = entry
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.data, indent=2, sort_keys=True))
-        tmp.replace(self.path)
+        with _file_lock(self.path.with_name("state.lock")):
+            self.data = self._read()
+            self.data[key] = entry
+            tmp = self.path.with_name(f".state.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(self.data, indent=2, sort_keys=True))
+            tmp.replace(self.path)
+
+
+@contextlib.contextmanager
+def _file_lock(path: Path):
+    """An exclusive flock on PATH for the block (released on exit, even on a crash)."""
+    try:
+        import fcntl
+    except ImportError:  # Windows: no cross-process lock
+        yield
+        return
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
 
 def take_dir(m: Manifest, key: str) -> Path:
@@ -115,7 +144,7 @@ def capture_take(m: Manifest, shot: Shot, tag: str | None, retries: int, log=say
             shutil.rmtree(frames_dir)
         try:
             t0 = time.monotonic()
-            with lock(shot.get("lock"), on_wait=lambda p: log(f"  {key}: waiting for lock {p}")):
+            with lock(shot.get("lock"), timeout=shot.get("lockTimeout"), on_wait=_lock_wait(key, log)):
                 result = BACKENDS[shot.backend](shot, device, variables, frames_dir, log=log)
             if not result["frames"]:
                 raise CaptureError("no frames captured")
@@ -139,7 +168,7 @@ def capture_take(m: Manifest, shot: Shot, tag: str | None, retries: int, log=say
                 meta["names"] = result["names"]
             (tdir / "meta.json").write_text(json.dumps(meta, indent=2))
             return meta
-        except (CaptureError, OSError, ValueError) as e:
+        except (CaptureError, LockTimeout, OSError, ValueError) as e:
             last = e
             msg = [l for l in _ANSI.sub("", str(e)).strip().splitlines() if l.strip() and "Call log" not in l]
             log(f"  {key}: attempt {attempt}/{attempts} failed: {msg[0] if msg else e}")
@@ -413,7 +442,7 @@ def run_prep(m: Manifest, shot: Shot, state: State, retries: int, force: bool, l
     for attempt in range(1, attempts + 1):
         try:
             t0 = time.monotonic()
-            with lock(shot.get("lock"), on_wait=lambda p: log(f"  {key}: waiting for lock {p}")):
+            with lock(shot.get("lock"), timeout=shot.get("lockTimeout"), on_wait=_lock_wait(key, log)):
                 command_backend.run_prep(shot, device, dict(m.vars, tag=""), log=log)
             absent = [o for o in outputs if not (m.dir / o).exists()]
             if absent:
@@ -424,13 +453,27 @@ def run_prep(m: Manifest, shot: Shot, state: State, retries: int, force: bool, l
                             "seconds": round(time.monotonic() - t0, 1),
                             "when": _dt.datetime.now().isoformat(timespec="seconds")})
             return
-        except (CaptureError, OSError, ValueError) as e:
+        except (CaptureError, LockTimeout, OSError, ValueError) as e:
             last = e
             msg = [l for l in _ANSI.sub("", str(e)).strip().splitlines() if l.strip()]
             log(f"  {key}: attempt {attempt}/{attempts} failed: {msg[0] if msg else e}")
             for extra in msg[1:4]:
                 log(f"      {extra}")
     raise CaptureError(f"{key}: all {attempts} attempt(s) failed: {last}")
+
+
+def _mark(key: str) -> None:
+    """Record the shot under way in the run registry (``darkroom ps`` shows it)."""
+    run = procs.current()
+    if run is not None:
+        run.set_shot(key)
+
+
+def _lock_wait(key: str, log):
+    def waiting(path):
+        holder = lock_holder(path)
+        log(f"  {key}: waiting for lock {path}" + (f" (held by pid {holder})" if holder else ""))
+    return waiting
 
 
 def shoot(m: Manifest, only=None, tag=None, retries=None, force=False, encode_only=False, log=say) -> int:
@@ -459,6 +502,7 @@ def shoot(m: Manifest, only=None, tag=None, retries=None, force=False, encode_on
         if shot.prep:
             if encode_only:
                 continue  # a prep makes no images, so there is nothing to re-encode
+            _mark(shot.name)
             try:
                 run_prep(m, shot, state, shot.get("retries", 2) if retries is None else retries,
                          force and (not only or shot.name in only), log)
@@ -488,6 +532,7 @@ def shoot(m: Manifest, only=None, tag=None, retries=None, force=False, encode_on
                     log(f"= {key}: up to date (use --force to reshoot)")
                     continue
                 reencode = True
+        _mark(key)
         log(f"> {key} ({shot.kind}{'' if shot.composite else ', ' + shot.backend})"
             + (": capture unchanged, re-encoding the saved take" if reencode else ""))
         try:

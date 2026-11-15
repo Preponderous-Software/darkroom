@@ -26,6 +26,14 @@ class LockTimeout(Exception):
     pass
 
 
+def lock_holder(path) -> int | None:
+    """The pid the lock file names (the last holder; the current one while it is busy)."""
+    try:
+        return int(Path(path).read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 @contextlib.contextmanager
 def lock(name: str | None, timeout: float | None = None, on_wait=None):
     """Hold the named lock for the duration of the block. ``name=None`` is a no-op.

@@ -38,7 +38,7 @@ VIDEO_FORMATS = ("mp4", "webm")
 TOP_KEYS = {"$schema", "out", "vars", "devices", "budgets", "defaults", "shots", "description"}
 COMMON_SHOT_KEYS = {
     "name", "kind", "backend", "caption", "alt", "device", "retries", "timeout", "lock",
-    "format", "quality", "width", "gif", "video", "poster", "sheet", "budgets", "skip", "comment",
+    "lockTimeout", "format", "quality", "width", "gif", "video", "poster", "sheet", "budgets", "skip", "comment",
     "aspect", "speed", "fps", "file", "gallery", "every", "colors", "inputs", "depends",
 }
 WEB_KEYS = {"url", "adapter", "ready", "readyTimeout", "css", "setup", "steps",
@@ -46,7 +46,7 @@ WEB_KEYS = {"url", "adapter", "ready", "readyTimeout", "css", "setup", "steps",
             "screenshotTimeout", "frameStep", "initScript", "context"}
 COMMAND_KEYS = {"argv", "env", "cwd", "xvfb", "repeat", "glob", "each", "outputs"}
 # A prep runs a command that writes files (no images): only these keys apply.
-PREP_KEYS = {"name", "kind", "backend", "comment", "skip", "lock", "timeout", "retries", "inputs",
+PREP_KEYS = {"name", "kind", "backend", "comment", "skip", "lock", "lockTimeout", "timeout", "retries", "inputs",
              "depends", "device", "argv", "env", "cwd", "xvfb", "outputs"}
 OUTPUT_KEYS = {"file", "caption", "alt"}
 # Browser-context options darkroom sets itself, and the shot field that sets each.
@@ -835,8 +835,15 @@ def validate(data: Any) -> list[str]:
             p.append(f"{w}.speed: must be a positive number (say so in the alt text when > 1)")
         if "retries" in s and not (isinstance(s["retries"], int) and s["retries"] >= 0):
             p.append(f"{w}.retries: must be a non-negative integer")
+        _check_lock_timeout(s, w, p)
     p += _dependency_cycles(m.shots)
     return p
+
+
+def _check_lock_timeout(s: dict, w: str, p: list[str]) -> None:
+    v = s.get("lockTimeout")
+    if v is not None and not (_num(v) and v > 0):
+        p.append(f"{w}.lockTimeout: must be a positive number of seconds to wait for the lock")
 
 
 def _validate_prep(s: dict, w: str, known_vars: set, p: list[str]) -> None:
@@ -849,6 +856,7 @@ def _validate_prep(s: dict, w: str, known_vars: set, p: list[str]) -> None:
                          f"outputs, inputs and depends")
             else:
                 p.append(f"{w}: unknown key '{k}'{_suggest(k, PREP_KEYS)}")
+    _check_lock_timeout(s, w, p)
     if s.get("backend", "command") != "command":
         p.append(f"{w}.backend: a prep runs a command; drop 'backend' (or set it to 'command')")
     argv = s.get("argv")

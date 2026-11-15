@@ -19,7 +19,8 @@ grids and a markdown gallery you can paste anywhere.
   says what it did.
 - **Built for slow, crowded machines.** Every shot retries with a fresh browser or process,
   finished shots are skipped on the next run, a failing shot doesn't stop the others, and
-  named file locks keep heavy rigs to one at a time.
+  named file locks keep heavy rigs to one at a time. Each run owns its processes:
+  `darkroom ps` lists the runs and `darkroom stop` stops one, and nothing else.
 
 ## Install
 
@@ -41,11 +42,11 @@ pip install "darkroom[video] @ git+https://github.com/Preponderous-Software/dark
 pin the tag so an upgrade there doesn't change your outputs under you:
 
 ```sh
-pip install "darkroom[video] @ git+https://github.com/Preponderous-Software/darkroom@v0.3.0"
+pip install "darkroom[video] @ git+https://github.com/Preponderous-Software/darkroom@v0.4.0"
 ```
 
 Each take's `meta.json` and each entry in `.darkroom/state.json` record the darkroom version
-that made it (`"darkroom": "0.3.0"`). Upgrading does not by itself mark shots stale (see
+that made it (`"darkroom": "0.4.0"`). Upgrading does not by itself mark shots stale (see
 [Takes, resume and re-encoding](#takes-resume-and-re-encoding)).
 
 ## Quickstart
@@ -84,15 +85,19 @@ darkroom gallery media.json --insert README.md        # update the images in a d
 
 ```text
 > developing (clip, web)
-  developing.gif: 334 KB
+  developing.gif: 307 KB
   developing.mp4: 42 KB (crf 23)
   developing.webm: 39 KB (crf 33)
   developing-poster.jpg: 19 KB
-  developing-sheet.png: 484 KB
+  developing-sheet.png: 765 KB
 = desktop: up to date (use --force to reshoot)
 ```
 
 ## What it makes
+
+Every image in this section was shot with darkroom 0.4 from
+[`examples/static-page/media.json`](examples/static-page/media.json); the stills came out
+byte-for-byte the same as 0.3's.
 
 | Shot | Output |
 |---|---|
@@ -101,24 +106,37 @@ darkroom gallery media.json --insert README.md        # update the images in a d
 | a before/after pair from two tagged runs of the same shot | ![Side by side: safelight and daylight](docs/img/theme-pair.jpg) |
 | a `command` still: any program that writes PNGs into `{out_dir}` | ![Concentric red rings](docs/img/card.jpg) |
 
-A contact sheet of every frame of a clip (`darkroom sheet media.json developing`), for
-reviewing a take before you publish it:
+A contact sheet of every frame of a clip (`darkroom sheet media.json developing --cols 6
+--thumb 160`), for reviewing a take before you publish it:
 
 ![A grid of 36 numbered frames](docs/img/developing-sheet.png)
 
-### Dogfood: Tangle
+## Used by
 
-[Tangle](https://github.com/Preponderous-Software/tangle) is a first-person game on Strata.
-`examples/tangle/media.json` is a port of its own capture script: it loads the game with
-`?drive=1`, poses the player through the game's JS hook, steps the engine clock exactly
-(`frames`), hides the HUD with `css`, and captures.
+Real outputs from public projects that keep a darkroom shot list.
+
+**[Tangle](https://github.com/Preponderous-Software/tangle)**, a first-person game on Strata
+about strange loops (MIT). `examples/tangle/media.json` is a port of its own capture script:
+it loads the game with `?drive=1`, poses the player through the game's JS hook, steps the
+engine clock exactly (`frames`), hides the HUD with `css`, and captures. More of its media is
+in [`docs/media`](https://github.com/Preponderous-Software/tangle/tree/main/docs/media).
 
 ![The hall of a fresh house](docs/img/tangle-hall.jpg)
 
-![Animation: walking sideways until three beams line up into an impossible triangle](docs/img/tangle-triangle-closes.gif)
+| ![Animation: walking sideways until three beams line up into an impossible triangle](docs/img/tangle-triangle-closes.gif) | ![Animation: a list of numbered rows with a diagonal of highlighted digits](docs/img/tangle-list-diagonal.gif) |
+|---|---|
+| `triangle-closes`, the 12-frame cut (118 KB GIF), shot in software WebGL on a heavily loaded machine. | `list-diagonal` (38 KB GIF): the List room's Cantor diagonal. |
 
-*The 12-frame cut of `triangle-closes` (118 KB GIF, 47 KB MP4), shot in software WebGL on a
-heavily loaded machine. The full clip is 50 frames.*
+**[Frozen Star](https://github.com/Preponderous-Software/frozen-star)**, a first-person
+black-hole game (MIT). Its shot list,
+[`tools/darkroom/media.json`](https://github.com/Preponderous-Software/frozen-star/blob/main/tools/darkroom/media.json),
+makes clips, MP4/WebM, stills and this captioned `grid` of three rooms; the clips are in
+[`docs/media/darkroom`](https://github.com/Preponderous-Software/frozen-star/tree/main/docs/media/darkroom)
+(for example [the descent](https://github.com/Preponderous-Software/frozen-star/blob/main/docs/media/darkroom/descent.mp4), a 68 KB MP4).
+
+![Three views side by side: the quarters, the lab and the bridge of the research ship Tern](docs/img/frozen-star-rooms.jpg)
+
+*Images copied from each project's repository, under its MIT license, with credit to it.*
 
 ## Manifest reference
 
@@ -153,7 +171,7 @@ Every shot:
 | `video` | `["mp4"]`, `["webm"]` or both; or `{ "formats": ["mp4"], "every": 2, "hold_last": 1.5 }`, where `hold_last` holds the last frame that many extra seconds. |
 | `poster` | Frame for a poster JPEG: an index, or a fraction of the clip (default 0.6 when there is video). |
 | `sheet` | `true` also publishes the contact sheet as `<name>-sheet.png` (one is always kept with the take for review); or `{ "labels": "none" \| "index" \| "caption", "cols": 4, "width": 1600 }`. `index` (default) labels tiles `#3`; `caption` uses each frame's `each` value. |
-| `retries`, `timeout`, `lock` | Attempts after the first (2), seconds per attempt, a lock name. |
+| `retries`, `timeout`, `lock`, `lockTimeout` | Attempts after the first (2), seconds per attempt, a lock name, and how many seconds to wait for that lock before the attempt fails (default: wait as long as it takes). |
 | `gallery` | How the gallery shows the shot: `{ "width": 480 }` writes `<img ... width="480">`; `"poster": true` shows a clip's poster beside its GIF (and makes the poster). Changing it never reshoots. |
 | `skip` | Leave the shot out of `shoot`. |
 | `inputs` | Paths or globs (relative to the manifest, templated) whose file contents feed the capture hash: a changed, added or removed file reshoots the shot. A directory stands for every file under it. |
@@ -370,7 +388,49 @@ several times over; a clip where the whole frame moves gains a little.
 `"lock": "browser"` on a shot takes an exclusive `flock` on `/tmp/darkroom-locks/browser.lock`
 (`$DARKROOM_LOCK_DIR` to move it) for the whole capture. Any number of darkroom processes,
 in any project, then take turns: use it for anything RAM-heavy or anything that must never
-run twice at once. Locks are released when the process exits, even on a crash.
+run twice at once. Locks are released when the process exits, even on a crash. While a lock
+is busy, darkroom says which pid holds it; `"lockTimeout": 600` makes an attempt fail after
+that many seconds of waiting instead of waiting for as long as it takes.
+
+Several runs may shoot one manifest at once (`--only A` in one shell, `--only B` in another):
+`.darkroom/state.json` is updated under its own lock and written atomically, so neither run
+loses the other's entries. Two runs of the *same* shot still share its take; darkroom warns
+when another run is already shooting the manifest.
+
+## Stopping a run: `darkroom ps` and `darkroom stop`
+
+**Never `pkill -f "darkroom shoot"`** (or `pkill chromium`, `pkill Xvfb`). On a shared machine
+that kills every other user's and every other project's captures too. Use `darkroom stop`,
+which stops exactly one run and the processes that run started:
+
+```sh
+darkroom ps                              # list this user's darkroom runs
+darkroom stop 3fa9c1                     # stop one run, by the id ps shows (a unique prefix will do)
+darkroom stop --manifest docs/media.json # stop the run shooting this manifest
+```
+
+```text
+RUN          PID     AGE  SHOT                     MANIFEST
+3fa9c1     41207   2m14s  triangle-closes          /home/me/tangle/media.json
+b20e7d     41388   0m40s  descent                  /home/me/frozen-star/tools/darkroom/media.json
+```
+
+How it works:
+
+- Every process darkroom starts (the Node runner and the Chromium it launches, `command`
+  programs, Xvfb, ffmpeg) runs in a new session, so it leads its own process group.
+- Each `darkroom shoot` registers itself in the run directory (`$DARKROOM_RUN_DIR`, else
+  `$XDG_RUNTIME_DIR/darkroom-runs`, else `/tmp/darkroom-runs-<uid>`) as `<run-id>.json`: its
+  pid, the process groups it is running, the manifest, cwd, start time and current shot.
+- On exit, an error, Ctrl-C, SIGTERM or SIGHUP, a run kills its own groups (SIGTERM, then
+  SIGKILL after 3 s), including descendants that started a session of their own, such as
+  Chromium under Playwright. A timeout does the same for the one program that ran over, and a
+  helper the program forked and left running is killed when the program exits.
+- `darkroom stop` sends the run SIGTERM, waits (`--timeout`, 15 s) while it cleans up, then
+  kills whatever of its groups is left. Pids are checked against their start time, so a
+  recycled pid is never signalled. `darkroom ps` prunes entries whose run is gone; a run that
+  was SIGKILLed with processes still running stays listed until `darkroom stop` cleans it up.
+- An interrupted or stopped `darkroom shoot` exits with `130` (Ctrl-C) or `143` (SIGTERM).
 
 ## Gallery
 
@@ -424,7 +484,9 @@ absolute path.
 ## Exit codes
 
 `0` everything worked; `1` at least one shot failed (the others still ran); `2` the manifest
-is invalid, a name is unknown, or the gallery cannot link a document (see **Links** above).
+is invalid, a name is unknown, or the gallery cannot link a document (see **Links** above);
+`130` / `143` the run was interrupted (Ctrl-C) or stopped (SIGTERM, `darkroom stop`), after
+killing its own processes.
 
 `darkroom check` also warns, without failing, about things that look wrong but may be fine at
 shoot time: a command shot's (or prep's) program that is not on `PATH` or not at its path,

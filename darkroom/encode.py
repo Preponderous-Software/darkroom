@@ -17,6 +17,8 @@ from typing import Sequence
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
 
+from . import procs
+
 FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/dejavu/DejaVuSans.ttf",
@@ -337,6 +339,9 @@ def find_ffmpeg() -> str | None:
         return None
 
 
+# Seconds one ffmpeg encode may take before it is killed (``$DARKROOM_FFMPEG_TIMEOUT``).
+FFMPEG_TIMEOUT = float(os.environ.get("DARKROOM_FFMPEG_TIMEOUT", 900))
+
 # CRF ladders: raise the CRF until the file fits (borrowed from the trailer recorder).
 CRF_LADDER = {"mp4": [23, 26, 29, 32, 35, 38], "webm": [33, 36, 40, 44, 48]}
 
@@ -366,7 +371,10 @@ def encode_video(frames: Sequence[Image.Image], out: Path, fmt: str, budget_kb: 
             else:
                 codec = ["-c:v", "libvpx-vp9", "-b:v", "0", "-crf", str(crf), "-row-mt", "1",
                          "-pix_fmt", "yuv420p"]
-            subprocess.run(base + codec + [str(out)], check=True, capture_output=True)
+            try:
+                procs.run(base + codec + [str(out)], check=True, timeout=FFMPEG_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(f"ffmpeg did not finish {out.name} within {FFMPEG_TIMEOUT:g}s")
             crf_used = crf
             if out.stat().st_size <= budget:
                 break

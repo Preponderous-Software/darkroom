@@ -17,6 +17,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from .. import procs
 from ..manifest import expand_argv, template
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
@@ -62,9 +63,15 @@ def _xvfb(width: int, height: int, args: list, timeout: float, env: dict):
     if not exe:
         raise CaptureError("xvfb: true but Xvfb is not installed (apt install xvfb)")
     r, w = os.pipe()
-    proc = subprocess.Popen([exe, "-displayfd", str(w), "-screen", "0", f"{width}x{height}x24",
-                             "-nolisten", "tcp", "-noreset", *args], pass_fds=(w,), env={**os.environ, **env},
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        # Its own session, so a stop or a crash of the program never leaves it behind.
+        proc = procs.spawn([exe, "-displayfd", str(w), "-screen", "0", f"{width}x{height}x24",
+                            "-nolisten", "tcp", "-noreset", *args], pass_fds=(w,), env={**os.environ, **env},
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except BaseException:
+        os.close(r)
+        os.close(w)
+        raise
     os.close(w)
     try:
         buf = b""
@@ -82,11 +89,7 @@ def _xvfb(width: int, height: int, args: list, timeout: float, env: dict):
         yield ":" + buf.decode().strip()
     finally:
         os.close(r)
-        proc.terminate()
-        try:
-            proc.wait(5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        procs.reap(proc)  # SIGTERM its group, SIGKILL after a grace period
 
 
 def _collect(out_dir: Path, glob: str | None) -> list[Path]:
@@ -222,7 +225,9 @@ def _run(shot, v, timeout, logs, display, gl_env=None, default_cwd="{work_dir}")
     if not os.path.isabs(cwd):
         cwd = os.path.join(v.get("manifest_dir", "."), cwd)
     try:
-        p = subprocess.run(argv, env=env, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        # Its own process group: a timeout, a stop or Ctrl-C kills the program and everything it
+        # started, and a grandchild holding the output pipes cannot hang the run.
+        p = procs.run(argv, env=env, cwd=cwd, text=True, timeout=timeout)
     except FileNotFoundError:
         raise CaptureError(f"command not found: {argv[0]}")
     except subprocess.TimeoutExpired:
