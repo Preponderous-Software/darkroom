@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.1 (2026-11-15)
 
 - `type` steps fill in vars (`{user}`), like `goto` and capture names.
 - `darkroom setup-web --link DIR | --install`: darkroom's own Playwright (in its cache), searched by every web shot, so `NODE_PATH` isn't needed once it's set up. A failed lookup now lists every place it searched and how to fix it.
