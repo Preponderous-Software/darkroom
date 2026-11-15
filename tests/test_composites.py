@@ -1,5 +1,7 @@
 """Contact sheets, captioned grids and the gallery's links and per-shot markers."""
 import json
+import shutil
+import subprocess
 
 import pytest
 from PIL import Image
@@ -193,3 +195,21 @@ def test_per_shot_markers(tmp_path, write_manifest, fake_cmd, capsys):
     assert "unknown shot(s) 'titel'" in capsys.readouterr().err
     doc.write_text("no markers\n")
     assert main(["gallery", str(p), "--insert", str(doc)]) == 2
+
+
+@pytest.mark.skipif(shutil.which("convert") is None, reason="ImageMagick not installed")
+@pytest.mark.parametrize("palette", ["adaptive", "octree", "median"])
+def test_gifs_decode_cleanly_in_imagemagick(tmp_path, palette):
+    # Pillow's optimizer with a palette per frame used to write colour indices past a frame's
+    # trimmed palette; ImageMagick refuses such files ("invalid colormap index").
+    from darkroom.encode import encode_gif
+    frames = []
+    for k in range(8):
+        im = Image.new("RGB", (160, 90), (20, 20, 30))
+        for x in range(0, 160, 8):
+            im.paste(((x * 7 + k * 40) % 256, (x * 3) % 256, (k * 30) % 256), (x, 20 + k * 5, x + 6, 60))
+        frames.append(im)
+    out = tmp_path / "t.gif"
+    encode_gif(frames, out, budget_mb=3, fps=5, width=160, palette=palette, colors=64)
+    r = subprocess.run(["convert", str(out), "-coalesce", str(tmp_path / "f_%02d.png")], capture_output=True, text=True)
+    assert "invalid" not in r.stderr, r.stderr

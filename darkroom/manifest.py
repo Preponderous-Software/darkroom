@@ -557,7 +557,7 @@ def validate(data: Any) -> list[str]:
             p.append(f"{w}.gif: must be an object or false")
         elif isinstance(gif, dict):
             _check_keys(gif, GIF_KEYS, f"{w}.gif", p)
-            if gif.get("palette", "octree") not in PALETTES:
+            if gif.get("palette", "adaptive") not in PALETTES:
                 p.append(f"{w}.gif.palette: must be one of {', '.join(PALETTES)}")
         video = s.get("video", [])
         if isinstance(video, str):

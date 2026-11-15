@@ -135,7 +135,7 @@ Every shot:
 | `each` | `web` and `command`: a list of values, one run each (a fresh browser or process), with `{value}`, `{i}` and `{n}` set (also in the page's `vars`). Implies `repeat` = its length. A still makes one image per value (`name-<value>.jpg`, or the `file` template); a clip plays the runs in order. |
 | `aspect` | Centre-crop every frame to a ratio such as `"16:9"` or `"1:1"`. |
 | `fps`, `speed` | Clip playback rate (12) and a speed-up factor. |
-| `gif` | `{ fps, width (640), palette, colors (256), dither (false), loop (0), budget_mb }`, or `false` for no GIF. Palettes: `octree` (per frame; keeps small saturated details), `median` (per frame, median cut), `adaptive` (one octree palette for the whole clip: no colour flicker). |
+| `gif` | `{ fps, width (640), palette, colors (256), dither (false), loop (0), budget_mb }`, or `false` for no GIF. Palettes: `adaptive` (the default: one octree palette for the whole clip, so no colour flicker, and the smallest files), `octree` (a palette per frame; keeps small saturated details), `median` (per frame, median cut). GIFs are written without Pillow's optimizer, which can leave colour indices past a frame's trimmed palette (strict decoders reject those files); budget fitting makes up the size. |
 | `video` | `["mp4"]`, `["webm"]` or both. |
 | `poster` | Frame for a poster JPEG: an index, or a fraction of the clip (default 0.6 when there is video). |
 | `sheet` | `true` also publishes the contact sheet as `<name>-sheet.png` (one is always kept with the take for review); or `{ "labels": "none" \| "index" \| "caption", "cols": 4, "width": 1600 }`. `index` (default) labels tiles `#3`; `caption` uses each frame's `each` value. |

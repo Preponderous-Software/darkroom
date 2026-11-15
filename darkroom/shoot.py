@@ -184,7 +184,7 @@ def encode_take(m: Manifest, shot: Shot, tag: str | None, log=say) -> list[str]:
             g = gif or {}
             results.append(enc.encode_gif(frames, at(".gif"), g.get("budget_mb", budgets["gif_mb"]),
                                           fps=fps, width=g.get("width", shot.get("width", 640)),
-                                          palette=g.get("palette", "octree"), colors=g.get("colors", 256),
+                                          palette=g.get("palette", "adaptive"), colors=g.get("colors", 256),
                                           dither=g.get("dither", False), loop=g.get("loop", 0)))
         video = shot.get("video", [])
         video = [video] if isinstance(video, str) else video

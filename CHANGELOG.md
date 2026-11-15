@@ -6,6 +6,8 @@ From the first pilot: a native desktop game captured through the `command` backe
 
 ### Changed
 
+- GIFs default to the `adaptive` palette. GIFs are no longer run through Pillow's optimizer, which could leave colour indices past a frame's trimmed palette, making GIFs that ImageMagick rejects ("invalid colormap index").
+
 - **`command` shots run in a scratch directory.** The default `cwd` is now `{work_dir}`, a
   fresh directory per run beside `{out_dir}` (deleted afterwards), not the manifest's
   directory, so files a program writes into its working directory (an `imgui.ini`, logs,

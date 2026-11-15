@@ -165,13 +165,16 @@ def _gif_bytes(frames, fps, palette, colors, dither, loop, hold_last_ms=0) -> by
     if hold_last_ms:
         durations[-1] = hold_last_ms
     buf = io.BytesIO()
+    # No optimize: Pillow's optimizer crops frames and trims their palettes, and can leave
+    # colour indices past the trimmed table: GIFs that strict decoders (ImageMagick) reject.
+    # Budget fitting makes up the size.
     q[0].save(buf, "GIF", save_all=True, append_images=q[1:], duration=durations,
-              loop=loop, optimize=True, disposal=1)
+              loop=loop, optimize=False, disposal=1)
     return buf.getvalue()
 
 
 def encode_gif(frames: Sequence[Image.Image], out: Path, budget_mb: float, fps: float = 12,
-               width: int | None = 640, palette: str = "octree", colors: int = 256,
+               width: int | None = 640, palette: str = "adaptive", colors: int = 256,
                dither: bool = False, loop: int = 0) -> Result:
     """Encode a GIF and fit it under ``budget_mb``: fewer colours (to 64), then narrower
     (by 15% steps, not under 240 px), then every other frame dropped (fps halves, so the
