@@ -192,7 +192,8 @@ Every shot:
 | `readyTimeout`, `waitUntil` | Milliseconds to wait for the page (120000) and the navigation event (`load`, `domcontentloaded`, `commit`). |
 | `css` | Styles injected once the page is ready (hide the HUD). |
 | `setup`, `steps` | Step lists, run in that order. A still is the page after the steps; a clip is every `capture`. |
-| `crop` | `[x, y, width, height]` in CSS pixels: capture only that part of the page. |
+| `crop` | `[x, y, width, height]` in CSS pixels: capture only that part of the page. Or `{"of": "css", "pad": 8}`: the box of the first element matching the selector, plus `pad` CSS pixels on every side (clamped to the viewport), measured at the shot's first capture and kept for the rest of it, so every frame is the same size. The rectangle used goes into the take's `meta.json` (`"crop": {"of", "pad", "rect": [x, y, w, h]}`; with `each`, `"crops"`, one per run). Frames are cut as they are taken, so `--encode` re-encodes the cut frames and never measures again. For a 16:10 band of a canvas, measure the canvas and add `"aspect": "16:10"`. |
+| `clock` | `{"mode": "paced", "step": 0.05}`: a paced clock for real-time pages (2D games, text games, anything on timers) that a slow machine cannot capture at their own speed. The page's timers and animation frames advance only when a `frames` step steps them, `step` seconds of page time each (default `1/30`). Also `"start"` and `"engine"`; see [Paced clock](#paced-clock-real-time-pages-frame-by-frame). |
 | `failOnConsole` | Console message types that fail the attempt: `["error", "warning"]` (also `info`, `log`, `debug`, ...; `error` includes uncaught exceptions). Every message is kept in the take's `console.jsonl` either way (see [Takes](#takes-resume-and-re-encoding)). |
 | `failOnConsoleError` | The same as `"failOnConsole": ["error"]` (kept from 0.1). Errors are always reported. |
 | `session` | A name: consecutive web shots with the same session share one browser page, so a heavy page loads once (see [Sessions](#sessions-one-page-for-several-shots)). |
@@ -212,10 +213,14 @@ Steps (one verb per object):
 | `{"tap": {"at": [0.5, 0.8], "of": "canvas"}}` | A tap at fractions of an element's box (`[0, 0]` is its top left, `[1, 1]` its bottom right), so taps on a canvas follow the layout from one device to the next. `click` takes the same form. |
 | `{"click": "css selector"}` | Clicks an element. |
 | `"force": true` | On `tap` and `click`: skip Playwright's actionability checks (visible, stable, receives events), for an element that never stops animating. |
+| `{"mouse": "down", "at": [x, y], "button": "right"}` | Presses a mouse button (`left`, the default, `right` or `middle`), after moving to `at` if it is given. `"up"` releases one. `at` takes every form `tap` does: `[x, y]`, a selector's centre, or `{"at": [fx, fy], "of": "css"}`. |
+| `{"mouse": "move", "at": ...}` / `{"mouse": "move", "by": [dx, dy]}` | Moves the pointer to a position, or by an offset from its last position, so a move inside a `repeat` walks the pointer along. `"steps": 5` sends intermediate moves. |
+| `{"drag": {"from": ..., "to": ..., "steps": 10, "button": "left"}}` | Moves to `from`, presses, moves to `to` in `steps` moves (default 10), releases: orbiting or looking around a 3D view. |
+| `{"wheel": {"dx": 0, "dy": -120}, "at": ...}` | Turns the mouse wheel by CSS pixels at the pointer (moving it to `at` first, if given). Negative `dy` scrolls up, which most 3D views read as zooming in. |
 | `{"stable": "css selector", "timeout": 30000}` | Waits until the element's box is the same over a few animation frames (it has stopped moving or resizing). Fails the attempt after `timeout` ms. |
 | `{"wait": 250}` | Waits, in wall-clock milliseconds. |
 | `{"waitFor": "js expr", "timeout": 30000}` | Waits until the expression is truthy: game state, not guesswork. Fails the attempt if it never is. |
-| `{"frames": 6}` / `{"frames": 3, "step": 0.1}` | `strata-kit`: drives 6 frames of game time (`step` seconds each; default `frameStep`). `hook`: waits 6 animation frames. |
+| `{"frames": 6}` / `{"frames": 3, "step": 0.1}` | `strata-kit`: drives 6 frames of game time (`step` seconds each; default `frameStep`). With a paced `clock`: advances the page's clock 6 times (`step` seconds each; default `clock.step`), running the timers that fall due and then the pending animation frames each time. Otherwise: waits 6 animation frames. |
 | `{"camera": {"yaw": 0.5, "dist": 8}}` | `strata-kit` only: sets any of `yaw`, `pitch`, `dist`, `tx`, `ty`, `tz`. |
 | `{"css": "..."}` | Injects styles at this point. |
 | `{"capture": true}` | Adds a frame to a clip. |
@@ -224,6 +229,74 @@ Steps (one verb per object):
 | `{"until": "js expr", "steps": [...], "max": 40, "then": 2}` | Runs the steps, then checks the expression, until it is truthy or `max` passes have run (a warning, not a failure), then `then` more passes. Inside: `i`, `n` (= `max`), `u`. |
 | `{"mark": "in"}` / `{"mark": "out"}` | Trims the clip to the frames between the marks. |
 | `{"repeat": 36, "var": "i", "steps": [...]}` | Runs the inner steps `n` times. |
+
+Mouse steps go through Playwright's mouse on every device, touch devices included. On a
+paced or `strata-kit` page a `drag` happens between two frames; to see the view turn while it
+is captured, hold the button and move in a `repeat`:
+
+```json
+"steps": [
+  { "mouse": "down", "at": { "at": [0.5, 0.5], "of": "canvas" } },
+  { "repeat": 30, "steps": [ { "mouse": "move", "by": [7, 1] }, { "frames": 1 }, { "capture": true } ] },
+  { "mouse": "up" }
+]
+```
+
+### Paced clock: real-time pages, frame by frame
+
+A screenshot can take longer than a frame lasts, so a real-time page captured as it runs plays
+too fast and skips. `strata-kit` solves that for Strata games by driving the engine's clock;
+`"clock": {"mode": "paced"}` does the same for any page by taking over the page's clock:
+
+```json
+{
+  "name": "play", "kind": "clip", "url": "{base}", "device": "desktop",
+  "clock": { "mode": "paced", "step": 0.05 },
+  "crop": { "of": "#board", "pad": 8 },
+  "steps": [ { "repeat": 120, "steps": [ { "frames": 1 }, { "capture": true } ] } ],
+  "fps": 20
+}
+```
+
+Each frame of that clip is the page exactly 50 ms of its own time after the last, however long
+the screenshot took, and a clip at `fps` 20 plays at the page's real speed. The same steps
+capture the same frames on a fast machine and a slow one.
+
+| Key | Meaning |
+|---|---|
+| `mode` | `paced` (required). |
+| `step` | Seconds of page time per `frames` step (default `1/30`). A `frames` step's own `step` overrides it. |
+| `start` | `ready` (default): the clock runs in real time while the page loads, until `ready` holds and `css` is applied, then stands still; this repeats after each `goto` or `reload`. `load`: paced from the page's first script, so even loading is deterministic, but a page that needs a timer or an animation frame to become ready never will (use `ready` for it). |
+| `engine` | `darkroom` (default) or `playwright`; see below. |
+
+**What is paced.** `setTimeout`, `setInterval`, `requestAnimationFrame` (and their `clear`/`cancel`
+functions), `performance.now()`, `Date.now()` and `new Date()`. Each `frames` step runs, in
+order of due time, every timer that falls due within the step (promise callbacks a timer queues
+run before the next timer), then every animation frame callback that was pending, once, with the
+new time. **What is not:** CSS animations and transitions, `<video>`, Web Audio, Web Workers, and
+timers in iframes (each frame gets its own clock, but only the top page is stepped). Network
+requests still take real time: wait for them with `waitFor` (which polls on wall-clock time and
+does not move the page's clock), or `until` with `frames` inside it to let the page's time pass
+while you wait. A `wait` step waits on the wall clock and moves the page's clock not at all;
+use `frames` for page time. `stable` polls on the wall clock too.
+
+**Engines.**
+
+- `darkroom` (the default) installs its own clock as an init script, before the page's scripts
+  and any `initScript`. One `frames` step runs **exactly one round** of animation frames, the
+  same pacing as a hand-rolled trailer stepper, so a page drawing WebGL in software renders once
+  per captured frame and nothing is drawn only to be thrown away.
+- `playwright` uses Playwright's own `page.clock` (Playwright 1.45 or newer): `install()` before
+  the page loads, `pauseAt` at the start, and `runFor(step)` per frame. It also fakes
+  `requestIdleCallback` and is maintained with Playwright, but it runs animation frames on its own 16 ms grid: a 50 ms step
+  runs three or four of them (8 steps ran 25 in darkroom's tests), each a full redraw, and at
+  `start: "ready"` it pauses up to a few tens of milliseconds after the page is ready (it cannot
+  pause in the past), running the timers due in that gap.
+
+Both engines replace the page's globals before its scripts run; a page that reads time some
+other way (`event.timeStamp`, `document.timeline`) still sees real time there. darkroom polls a
+paced shot's `ready` from Node rather than inside the page, whose timers may be standing still.
+The `strata-kit` adapter already drives its game's clock, so it takes no `clock`.
 
 ### Sessions: one page for several shots
 
@@ -248,7 +321,7 @@ in turn on that page, and each shot is captured as usual. Move between screens w
 `waitFor` steps rather than `goto` (which loads the page again).
 
 - Every shot of a session must agree on what opens the page: `url`, `device`, `setup`, `ready`,
-  `css`, `adapter`, `initScript`, `context`, `block`, `launchArgs`, `userAgent`, `lock`, ...
+  `css`, `adapter`, `clock`, `initScript`, `context`, `block`, `launchArgs`, `userAgent`, `lock`, ...
   (`darkroom check` names the first field that differs). Put them in `defaults`.
 - Only consecutive shots share a page (in run order: `depends` and `--only` can change it). A
   shot of another session, or with none, in between closes it.
@@ -417,7 +490,7 @@ uncaught exception; with `each`, each line also has its `run`. Add `.darkroom/` 
 `darkroom shoot` keeps two hashes per shot:
 
 - the **capture hash**: only what changes the pixels captured (the url or argv, steps, setup,
-  device, adapter, ready, css, crop, `initScript`, `context`, the vars, the contents of the
+  device, adapter, ready, css, crop, `clock`, `initScript`, `context`, the vars, the contents of the
   shot's `inputs`, and so on). When it changes, the shot is reshot.
 - the **encode hash**: what changes the files made from a take (format, quality, width, `gif`,
   `video`, `poster`, `sheet`, `aspect`, `speed`, `fps`, `every`, `colors`, `file`, budgets).
