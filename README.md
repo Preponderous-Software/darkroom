@@ -155,6 +155,7 @@ Top level:
 | `budgets` | `still_kb` (200), `gif_mb` (3), `mp4_kb` (600), `webm_kb` (400). A shot can override any of them in its own `budgets`. |
 | `defaults` | Fields every shot starts from. Objects merge one level deep, lists are replaced unless the shot writes `KEY+` to extend them (`argv+`, `steps+`, `setup+`, `block+`, `launchArgs+`), and fields for the other backend are ignored. |
 | `shots` | The list of shots. |
+| `description`, `$schema` | Free text and a schema URL for your editor; darkroom ignores both. |
 
 Every shot:
 
@@ -180,6 +181,7 @@ Every shot:
 | `retries`, `timeout`, `lock`, `lockTimeout` | Attempts after the first (2), seconds per attempt, a lock name, and how many seconds to wait for that lock before the attempt fails (default: wait as long as it takes). |
 | `gallery` | How the gallery shows the shot: `{ "width": 480 }` writes `<img ... width="480">`; `"poster": true` shows a clip's poster beside its GIF (and makes the poster); `"row": "title"` names a plain still's row in the [table layout](#gallery). Changing it never reshoots. |
 | `skip` | Leave the shot out of `shoot`. |
+| `comment` | Free text for whoever reads the manifest (also on `prep` shots and in `defaults`). Changing it never reshoots. |
 | `inputs` | Paths or globs (relative to the manifest, templated) whose file contents feed the capture hash: a changed, added or removed file reshoots the shot. A directory stands for every file under it. |
 | `depends` | Shot names that run first. A `prep` named here also runs under `--only` (unless it is up to date), and its `outputs` count as this shot's `inputs`. |
 
@@ -215,7 +217,7 @@ Steps (one verb per object):
 | `{"tap": [x, y]}` / `{"tap": "css selector"}` | A touch tap (on touch devices; a click otherwise), at a point or at the centre of the first matching element. |
 | `{"tap": {"at": [0.5, 0.8], "of": "canvas"}}` | A tap at fractions of an element's box (`[0, 0]` is its top left, `[1, 1]` its bottom right), so taps on a canvas follow the layout from one device to the next. `click` takes the same form. |
 | `{"click": "css selector"}` | Clicks an element. |
-| `"force": true` | On `tap` and `click`: skip Playwright's actionability checks (visible, stable, receives events), for an element that never stops animating. |
+| `"force": true` | On `tap` and `click`: skip Playwright's actionability checks (visible, stable, receives events), for an element that never stops animating. On `mouse`, `drag` and `wheel`: skip the wait for a selector position's element to be visible. |
 | `{"mouse": "down", "at": [x, y], "button": "right"}` | Presses a mouse button (`left`, the default, `right` or `middle`), after moving to `at` if it is given. `"up"` releases one. `at` takes every form `tap` does: `[x, y]`, a selector's centre, or `{"at": [fx, fy], "of": "css"}`. |
 | `{"mouse": "move", "at": ...}` / `{"mouse": "move", "by": [dx, dy]}` | Moves the pointer to a position, or by an offset from its last position, so a move inside a `repeat` walks the pointer along. `"steps": 5` sends intermediate moves. |
 | `{"drag": {"from": ..., "to": ..., "steps": 10, "button": "left"}}` | Moves to `from`, presses, moves to `to` in `steps` moves (default 10), releases: orbiting or looking around a 3D view. |
@@ -229,9 +231,9 @@ Steps (one verb per object):
 | `{"capture": true}` | Adds a frame to a clip. |
 | `{"capture": "name"}` | In a still: writes `name.jpg` (or `.png`) beside the shot's outputs. Several in one shot make several stills from one browser session, with no replays. Names are unique per shot. |
 | `{"goto": "url"}` / `{"reload": true}` | Navigates (relative to the current page; vars are filled in) or reloads, then waits for `ready` and re-applies `css`, as at the start. The `strata-kit` clock starts again. |
-| `{"until": "js expr", "steps": [...], "max": 40, "then": 2}` | Runs the steps, then checks the expression, until it is truthy or `max` passes have run (a warning, not a failure), then `then` more passes. Inside: `i`, `n` (= `max`), `u`. |
+| `{"until": "js expr", "steps": [...], "max": 40, "then": 2}` | Runs the steps, then checks the expression, until it is truthy or `max` passes have run (a warning, not a failure), then `then` more passes. Inside: `i`, `n` (= `max`), `u`; `"var"` renames `i`. |
 | `{"mark": "in"}` / `{"mark": "out"}` | Trims the clip to the frames between the marks. |
-| `{"repeat": 36, "var": "i", "steps": [...]}` | Runs the inner steps `n` times. |
+| `{"repeat": 36, "var": "i", "steps": [...]}` | Runs the inner steps `n` times. `var` names the counter (default `i`), so a nested `repeat` keeps the outer one's. |
 
 Mouse steps go through Playwright's mouse on every device, touch devices included. On a
 paced or `strata-kit` page a `drag` happens between two frames; to see the view turn while it
