@@ -217,7 +217,7 @@ Steps (one verb per object):
 | `{"tap": [x, y]}` / `{"tap": "css selector"}` | A touch tap (on touch devices; a click otherwise), at a point or at the centre of the first matching element. |
 | `{"tap": {"at": [0.5, 0.8], "of": "canvas"}}` | A tap at fractions of an element's box (`[0, 0]` is its top left, `[1, 1]` its bottom right), so taps on a canvas follow the layout from one device to the next. `click` takes the same form. |
 | `{"click": "css selector"}` | Clicks an element. |
-| `"force": true` | On `tap` and `click`: skip Playwright's actionability checks (visible, stable, receives events), for an element that never stops animating. On `mouse`, `drag` and `wheel`: skip the wait for a selector position's element to be visible. |
+| `"force": true` | On `{"click": "css selector"}`: skip Playwright's actionability checks (visible, stable, receives events), for an element that never stops animating. On `tap`, a `click` at fractions of an element, `mouse`, `drag` and `wheel`: skip the wait for the element to be visible. |
 | `{"mouse": "down", "at": [x, y], "button": "right"}` | Presses a mouse button (`left`, the default, `right` or `middle`), after moving to `at` if it is given. `"up"` releases one. `at` takes every form `tap` does: `[x, y]`, a selector's centre, or `{"at": [fx, fy], "of": "css"}`. |
 | `{"mouse": "move", "at": ...}` / `{"mouse": "move", "by": [dx, dy]}` | Moves the pointer to a position, or by an offset from its last position, so a move inside a `repeat` walks the pointer along. `"steps": 5` sends intermediate moves. |
 | `{"drag": {"from": ..., "to": ..., "steps": 10, "button": "left"}}` | Moves to `from`, presses, moves to `to` in `steps` moves (default 10), releases: orbiting or looking around a 3D view. |
