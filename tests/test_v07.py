@@ -73,6 +73,14 @@ def test_mouse_drag_and_wheel_validation():
     assert any("unknown step 'mous'" in x and "did you mean 'mouse'" in x for x in steps({"mous": "down"}))
 
 
+def test_click_takes_a_point():
+    # #27: the runner's pointOf takes [x, y] for click, as it does for tap; check must agree.
+    assert steps({"click": [120, 48.5]}, {"click": "#b"}, {"click": {"at": [0.5, 0.5], "of": "#b"}}) == []
+    assert any("click: a point must be [x, y], two numbers" in x for x in steps({"click": [1, 2, 3]}))
+    assert any("click: a point must be [x, y], two numbers" in x for x in steps({"click": ["1", 2]}))
+    assert any("click: must be a string (a CSS selector), [x, y] in CSS pixels" in x for x in steps({"click": 5}))
+
+
 def test_clock_validation():
     paced = {"mode": "paced", "step": 0.05}
     assert steps({"frames": 3, "step": 0.1}, clock=paced) == []
