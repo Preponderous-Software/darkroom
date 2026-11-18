@@ -519,9 +519,12 @@ def validate_steps(steps, where: str, adapter: str, problems: list[str], kind: s
                                 f"([0.5, 0.5] is its centre)")
             if not (isinstance(of, str) and of.strip()):
                 problems.append(f"{w}.{verb}.of: required, a CSS selector for the element whose box 'at' is in")
+        elif verb == "click" and isinstance(v, list):
+            if not (len(v) == 2 and all(_num(x) for x in v)):
+                problems.append(f"{w}.click: a point must be [x, y], two numbers in CSS pixels")
         elif verb in ("js", "click", "waitFor", "css", "type", "stable") and not isinstance(v, str):
             problems.append(f"{w}.{verb}: must be a string" + (
-                " (a CSS selector), or {\"at\": [fx, fy], \"of\": \"css\"}" if verb == "click" else
+                " (a CSS selector), [x, y] in CSS pixels, or {\"at\": [fx, fy], \"of\": \"css\"}" if verb == "click" else
                 " (a CSS selector; waits until its box stops moving)" if verb == "stable" else ""))
         elif verb == "mark" and v not in ("in", "out"):
             problems.append(f"{w}.mark: must be 'in' or 'out' (trims a clip to the frames between)")
