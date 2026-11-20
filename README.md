@@ -149,7 +149,7 @@ Top level:
 | Key | Meaning |
 |---|---|
 | `out` | Output directory, relative to the manifest (default `media`). |
-| `vars` | Values for `{name}` placeholders in `url`, `ready`, `argv`, `env`, `cwd` and `file`. Vars may use other vars. `--var name=value` overrides. A var can be a list, spliced into `argv` as a whole `"@name"` entry (see [Shared flags](#shared-flags-list-vars-and-key)). Built in: `{manifest_dir}`; with `each`, `{value}`, `{i}`, `{n}`; and for `command` shots `{out_dir}`, `{work_dir}`, `{width}`, `{height}`, `{dpr}`, `{display}`, `{name}`, `{tag}`. Unknown placeholders are left alone, so JS and JSON braces are safe. A shot can add or override vars in its own `vars`. |
+| `vars` | Values for `{name}` placeholders in `url`, `ready`, `argv`, `env`, `cwd`, `xvfb.env`, `file`, `device`, `inputs`, `outputs`, `initScript`, `context`, and the `goto`, `type` and `capture` steps. Vars may use other vars. `--var name=value` overrides. A var can be a list, spliced into `argv` as a whole `"@name"` entry (see [Shared flags](#shared-flags-list-vars-and-key)). Built in: `{manifest_dir}`; with `each`, `{value}`, `{i}`, `{n}`; and for `command` shots `{out_dir}`, `{work_dir}`, `{width}`, `{height}`, `{dpr}`, `{display}`, `{name}`, `{tag}`. Unknown placeholders are left alone, so JS and JSON braces are safe. A shot can add or override vars in its own `vars`. |
 | `devices` | Extra devices: `{ "name": { "width", "height", "dpr", "touch", "mobile" } }`. |
 | `gallery` | How `darkroom gallery` lays the shots out by default: `{ "layout": "table", "by": "device", "widths": { "phone": 200 } }` (see [Gallery](#gallery)). `layout` is `list` (the default) or `table`. |
 | `budgets` | `still_kb` (200), `gif_mb` (3), `mp4_kb` (600), `webm_kb` (400). A shot can override any of them in its own `budgets`. |
@@ -213,7 +213,7 @@ Steps (one verb per object):
 |---|---|
 | `{"js": "expr or statements"}` | Runs in the page. Sees `vars`, and inside a `repeat`: `i`, `n` and `u` (`i / (n - 1)`, for easing). |
 | `{"key": "KeyW", "action": "down"}` | `down`, `up` or `press` (default). |
-| `{"type": "hello"}` | Types text. |
+| `{"type": "hello"}` | Types text. Vars are filled in (`"{user}"`), as in `goto` and capture names. |
 | `{"tap": [x, y]}` / `{"tap": "css selector"}` | A touch tap (on touch devices; a click otherwise), at a point or at the centre of the first matching element. |
 | `{"tap": {"at": [0.5, 0.8], "of": "canvas"}}` | A tap at fractions of an element's box (`[0, 0]` is its top left, `[1, 1]` its bottom right), so taps on a canvas follow the layout from one device to the next. `click` takes the same form. |
 | `{"click": "css selector"}` / `{"click": [x, y]}` | Clicks an element, or a point in CSS pixels. |
